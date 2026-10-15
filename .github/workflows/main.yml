@@ -120,7 +120,7 @@ jobs:
           const DB = (process.env.FIREBASE_DB_URL || "").trim().replace(/\/+$/, "");
           if (!DB) { console.log("::error::GitHub secret ZEDGE4_DB_URL is missing - set it in GitHub > Settings > Secrets and variables > Actions"); process.exit(1); }
           const ACCOUNT = "ZEDGE4";
-          const DEFAULT_WINDOWS = [9, 14, 19];   // window start hours (Asia/Dhaka) - fallback only
+          const DEFAULT_WINDOWS = [5, 11, 17];   // window start hours (Asia/Dhaka) - fallback only
           const WINDOW_HOURS = 3;                      // each window lasts 3 hours
           const SLOT_MIN = 30;                         // scheduler pings every 30 min
           const RUN_ID = process.env.GITHUB_RUN_ID || "";
@@ -1109,6 +1109,556 @@ jobs:
         run: |
           @'
           const { chromium } = require("playwright");
+
+          /* ------------------------------------------------------------------ */
+          /* MH-EARNINGS v3 - after every publish run the bot reads the Zedge     */
+          /* dashboard (stat cards + daily chart + payments history) and pushes   */
+          /* it into this account's Firebase: dashboardSettings/earnings.         */
+          /* ------------------------------------------------------------------ */
+          const EARN_THRESHOLD = Number(process.env.EARN_THRESHOLD || "50") || 50;
+          const EARN_MONTHS = ["january","february","march","april","may","june","july","august","september","october","november","december"];
+
+          function earnLog(msg) { console.log("\uD83D\uDCB0 earnings: " + msg); }
+          function earnPad(n) { return String(n).padStart(2, "0"); }
+          function earnIso(y, m, d) { return `${y}-${earnPad(m + 1)}-${earnPad(d)}`; }
+          function earnDaysInMonth(y, m) { return new Date(Date.UTC(y, m + 1, 0)).getUTCDate(); }
+          function earnMoney(txt) {
+            const m = String(txt || "").replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
+            return m ? Number(m[0]) : null;
+          }
+          function earnTitle(m, y) { return `${EARN_MONTHS[m][0].toUpperCase()}${EARN_MONTHS[m].slice(1)} ${y}`; }
+
+          /* "June 2026" / "2026 June" / "JUN 2026" -> { y, m } (m is 0-based) */
+          function earnParseMonth(text) {
+            const t = String(text || "").toLowerCase();
+            for (let i = 0; i < 12; i++) {
+              const full = EARN_MONTHS[i], abbr = full.slice(0, 3);
+              const re = new RegExp(`(?:^|[^a-z])(${full}|${abbr})[^0-9a-z]{0,4}(20\\d{2})|(20\\d{2})[^0-9a-z]{0,4}(${full}|${abbr})(?:[^a-z]|$)`);
+              const hit = t.match(re);
+              if (hit) return { m: i, y: Number(hit[2] || hit[3]) };
+            }
+            return null;
+          }
+
+          /* Reads the "Payments history" tab: newest paid month + the whole table. */
+          async function earnReadLastPayment(page) {
+            await page.goto("https://upload.zedge.net", { waitUntil: "domcontentloaded" });
+            await page.waitForTimeout(4000);
+            const tab = page.locator("a", { hasText: /^\s*Payments history\s*$/i }).first();
+            if (!(await tab.count())) { earnLog("Payments history tab not found"); return null; }
+            await tab.click();
+            await page.waitForTimeout(6000);
+
+            const text = await page.evaluate(() => document.body.innerText || "");
+            if (/received\s*any\s*payments\s*yet/i.test(text)) {
+              earnLog("payments history is empty - no payment received yet");
+              return null;
+            }
+            const lines = text.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+
+            /* The table renders one row per line: METHOD / DATE / REASON / AMOUNT.
+               Some themes split it over a few lines, so group by the amount token. */
+            const payments = [];
+            let best = null;
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i];
+              const joined = [line, lines[i + 1] || "", lines[i + 2] || "", lines[i + 3] || ""].join(" ");
+              const when = earnParseMonth(line) || earnParseMonth(joined);
+              if (!when) continue;
+              if (/payment\s*method|payment\s*date/i.test(line)) continue;
+              const amount = earnMoney((joined.match(/\$\s?[\d,]+(?:\.\d{1,2})?/) || [])[0]);
+              if (amount == null) continue;
+              const paidOn = (joined.match(/[A-Z][a-z]+\s+\d{1,2},\s*20\d{2}/) || [""])[0];
+              const method = (joined.match(/\b(DOTS|PAYPAL|PayPal|Paypal|Payoneer|Wire|Bank)\b/) || [""])[0];
+              const key = when.y * 12 + when.m;
+              if (!payments.some((p) => p.monthKey === key)) {
+                payments.push({
+                  monthKey: key,
+                  month: earnTitle(when.m, when.y),
+                  paidOn,
+                  method,
+                  amount,
+                  reason: joined.replace(/\s+/g, " ").slice(0, 120),
+                });
+              }
+              if (!best || key > best.key) best = { key, ...when, amount, paidOn };
+            }
+            payments.sort((a, b) => b.monthKey - a.monthKey);
+            if (!best) { earnLog("no payment rows found on the payments page"); return null; }
+            earnLog(`last payment = ${earnTitle(best.m, best.y)}${best.amount != null ? " ($" + best.amount + ")" : ""} / ${payments.length} rows`);
+            best.payments = payments.slice(0, 12).map(({ monthKey, ...p }) => p);
+            return best;
+          }
+
+          /* No payment ever received -> start at the oldest month on the Reports tab. */
+          async function earnReadReportsOldestMonth(page) {
+            try {
+              await page.goto("https://upload.zedge.net", { waitUntil: "domcontentloaded" });
+              await page.waitForTimeout(4000);
+              const tab = page.locator("a", { hasText: /^\s*Reports\s*$/i }).first();
+              if (!(await tab.count())) { earnLog("Reports tab not found"); return null; }
+              await tab.click();
+              await page.waitForTimeout(6000);
+
+              const labels = await page.evaluate(() => {
+                const out = [];
+                document.querySelectorAll("td,th,span,div,p").forEach((e) => {
+                  if (e.querySelector("div,span,button,svg,p")) return;
+                  const t = (e.textContent || "").replace(/\s+/g, " ").trim();
+                  if (!t || t.length > 24) return;
+                  if (/^(20\d{2}\s+[A-Za-z]{3,9}|[A-Za-z]{3,9}\s+20\d{2})$/.test(t)) out.push(t);
+                });
+                return [...new Set(out)];
+              });
+
+              const months = labels.map(earnParseMonth).filter(Boolean);
+              if (!months.length) { earnLog("no month rows found on Reports"); return null; }
+              months.sort((a, b) => a.y * 12 + a.m - (b.y * 12 + b.m));
+              earnLog(`Reports months = ${months.length}, oldest = ${earnTitle(months[0].m, months[0].y)}`);
+              return months[0];
+            } catch (e) {
+              earnLog("reading Reports failed: " + e.message);
+              return null;
+            }
+          }
+
+          /* Calendar helpers -------------------------------------------------- */
+          async function earnOpenCalendar(page) {
+            const input = page.locator('input[name="period"]').first();
+            await input.waitFor({ state: "visible", timeout: 30000 });
+            await input.click();
+            await page.waitForTimeout(1500);
+          }
+          async function earnPanelMonths(page) {
+            return await page.evaluate(() => {
+              const out = [];
+              document.querySelectorAll("div").forEach((d) => {
+                const t = (d.textContent || "").trim();
+                if (d.children.length === 0 && /^20\d{2}\s+[A-Z][a-z]+$/.test(t)) out.push(t);
+              });
+              return [...new Set(out)];
+            });
+          }
+          async function earnStepMonth(page, dir) {
+            const icon = dir < 0 ? "angle-left" : "angle-right";
+            const arrow = page.locator(`svg[data-icon="${icon}"]`).first();
+            if (!(await arrow.count())) throw new Error("calendar arrow not found");
+            await arrow.click({ force: true });
+            await page.waitForTimeout(800);
+          }
+          /* Walk the calendar until the wanted month is one of the two visible panels. */
+          async function earnShowMonth(page, year, month) {
+            const want = `${year} ${EARN_MONTHS[month][0].toUpperCase()}${EARN_MONTHS[month].slice(1)}`;
+            for (let i = 0; i < 40; i++) {
+              const shown = await earnPanelMonths(page);
+              if (shown.includes(want)) return want;
+              const first = shown.length ? earnParseMonth(shown[0]) : null;
+              const dir = !first ? -1 : (year * 12 + month) < (first.y * 12 + first.m) ? -1 : 1;
+              await earnStepMonth(page, dir);
+            }
+            throw new Error(`could not reach ${want} in the calendar`);
+          }
+          /* Signature of all day cells - changes as soon as a day is really selected. */
+          async function earnGridSignature(page) {
+            return await page.evaluate(() => {
+              const heads = [...document.querySelectorAll("div")].filter(
+                (d) => d.children.length === 0 && /^20\d{2}\s+[A-Z][a-z]+$/.test((d.textContent || "").trim())
+              );
+              if (!heads.length) return "";
+              let root = heads[0];
+              for (let i = 0; i < 6 && root.parentElement; i++) root = root.parentElement;
+              return [...root.querySelectorAll("div")]
+                .filter((d) => /^\d{1,2}$/.test((d.textContent || "").trim()) || d.children.length === 1)
+                .map((d) => d.className || "")
+                .join("|");
+            });
+          }
+
+          /* The picker opens with a default range - clear it so the first click starts
+             a fresh range instead of extending the preset one. */
+          async function earnResetRange(page) {
+            const btn = page.locator('button[styletype="ghost"]').first();
+            if (!(await btn.count())) { earnLog("Reset button not found - continuing"); return; }
+            try { await btn.click(); } catch (e) { earnLog("reset click failed: " + e.message); }
+            await page.waitForTimeout(900);
+            const heads = await earnPanelMonths(page);
+            if (!heads.length) await earnOpenCalendar(page);
+          }
+
+          async function earnPeriodValue(page) {
+            return await page.evaluate(() => {
+              const i = document.querySelector('input[name="period"]');
+              return i ? (i.value || "").trim() : "";
+            });
+          }
+
+          /* Clicks ONE day inside the panel of the given month header. A second click
+             would be read as the next endpoint and would restart the range. */
+          async function earnClickDay(page, header, day) {
+            const before = await earnGridSignature(page);
+            const ok = await page.evaluate(({ header, day }) => {
+              const heads = [...document.querySelectorAll("div")].filter(
+                (d) => d.children.length === 0 && (d.textContent || "").trim() === header
+              );
+              if (!heads.length) return false;
+              let panel = heads[0].parentElement;
+              for (let i = 0; i < 3 && panel && panel.querySelectorAll("div").length < 25; i++) panel = panel.parentElement;
+              if (!panel) return false;
+              const cells = [...panel.querySelectorAll("div")].filter(
+                (d) => d.children.length === 0 && (d.textContent || "").trim() === String(day)
+              );
+              if (!cells.length) return false;
+              /* filler days of the neighbouring month repeat the number: early days sit
+                 at the top of the grid, late days at the bottom */
+              const cell = day <= 15 ? cells[0] : cells[cells.length - 1];
+              const r = cell.getBoundingClientRect();
+              const ev = (type) => cell.dispatchEvent(new MouseEvent(type, { bubbles: true, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2 }));
+              ev("mousedown"); ev("mouseup"); ev("click");
+              return true;
+            }, { header, day });
+            if (!ok) throw new Error(`day ${day} not clickable in ${header}`);
+            await page.waitForTimeout(900);
+            const after = await earnGridSignature(page);
+            earnLog(`clicked ${day} in ${header}${after !== before ? "" : " (no visual change!)"}`);
+          }
+          async function earnApply(page) {
+            const btn = page.locator("button", { hasText: /^\s*Apply\s*$/ }).first();
+            if (!(await btn.count())) throw new Error("Apply button not found");
+            await btn.click();
+            await page.waitForTimeout(9000);
+          }
+
+          /* Reads the three stat cards (Unlocks / Users / Net revenue). */
+          async function earnReadCards(page) {
+            return await page.evaluate(() => {
+              const num = (s) => {
+                const t = String(s).replace(/[$,\s]/g, "");
+                const m = t.match(/^(-?\d+(?:\.\d+)?)([kKmM])?$/);
+                if (!m) return null;
+                let v = Number(m[1]);
+                if (/k/i.test(m[2] || "")) v *= 1000;
+                if (/m/i.test(m[2] || "")) v *= 1000000;
+                return v;
+              };
+              const lines = (document.body.innerText || "").split(/\n+/).map((l) => l.trim()).filter(Boolean);
+              const pick = (label) => {
+                for (let i = 0; i < lines.length; i++) {
+                  if (!new RegExp(`^${label}$`, "i").test(lines[i])) continue;
+                  for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
+                    const v = num(lines[j]);
+                    if (v != null) return v;
+                  }
+                }
+                return null;
+              };
+              return { unlocks: pick("unlocks"), users: pick("users"), netRevenue: pick("net revenue") };
+            });
+          }
+
+          /* Reads the Net revenue total for the range currently applied. */
+          async function earnReadNetRevenue(page) {
+            const cards = await earnReadCards(page);
+            if (cards && cards.netRevenue != null) {
+              return { value: cards.netRevenue, source: "card", cards };
+            }
+            const got = await page.evaluate(() => {
+              const body = document.body.innerText || "";
+              const clean = (s) => Number(String(s).replace(/[$,\s]/g, ""));
+              const lines = body.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+              for (let i = 0; i < lines.length; i++) {
+                if (!/net\s*revenue|total\s*revenue|earnings/i.test(lines[i])) continue;
+                for (let j = i; j < Math.min(i + 4, lines.length); j++) {
+                  const m = lines[j].match(/\$\s?[\d,]+(?:\.\d+)?/);
+                  if (m) return { value: clean(m[0]), source: "label" };
+                }
+              }
+              const all = [...body.matchAll(/\$\s?[\d,]+(?:\.\d{1,2})?/g)].map((m) => clean(m[0])).filter((n) => !isNaN(n));
+              if (all.length) return { value: Math.max(...all), source: "max-amount" };
+              return null;
+            });
+            if (got) got.cards = cards || null;
+            return got;
+          }
+
+          /* Reads the "Daily overview" chart: one point per day, estimated from the
+             stacked bar heights and the y-axis scale. Used for the dashboard chart. */
+          async function earnReadDaily(page) {
+            try {
+              return await page.evaluate(() => {
+                const svgs = [...document.querySelectorAll("svg")];
+                let host = null;
+                for (const s of svgs) {
+                  if (s.querySelectorAll('g[role="listitem"]').length > 10) { host = s; break; }
+                }
+                if (!host) return null;
+                /* y-axis scale: biggest "$n" tick label inside the chart */
+                let axisMax = 0;
+                host.querySelectorAll("text").forEach((t) => {
+                  const m = (t.textContent || "").trim().match(/^\$\s?([\d.]+)$/);
+                  if (m) axisMax = Math.max(axisMax, Number(m[1]));
+                });
+                const series = [...host.querySelectorAll('g[role="group"][aria-label]')].filter(
+                  (g) => g.querySelectorAll('g[role="listitem"]').length > 5
+                );
+                if (!series.length) return null;
+                const plotH = 296;
+                const buckets = new Map();
+                let maxPx = 0;
+                for (const g of series) {
+                  const name = g.getAttribute("aria-label") || "";
+                  [...g.querySelectorAll('g[role="listitem"]')].forEach((item, i) => {
+                    const tr = item.getAttribute("transform") || "";
+                    const xy = tr.match(/translate\(([-\d.]+),\s*([-\d.]+)\)/);
+                    const x = xy ? Number(xy[1]) : i;
+                    const p = item.querySelector("path");
+                    const d = p ? p.getAttribute("d") || "" : "";
+                    const ys = [...d.matchAll(/[ML]\s*[\d.]+,\s*([\d.]+)/g)].map((q) => Number(q[1]));
+                    const h = ys.length ? Math.max.apply(null, ys) : 0;
+                    const key = Math.round(x);
+                    const cur = buckets.get(key) || { x: key, total: 0, parts: {} };
+                    cur.parts[name] = (cur.parts[name] || 0) + h;
+                    cur.total += h;
+                    buckets.set(key, cur);
+                    maxPx = Math.max(maxPx, cur.total);
+                  });
+                }
+                const rows = [...buckets.values()].sort((a, b) => a.x - b.x);
+                if (!rows.length) return null;
+                const scale = axisMax > 0 && plotH > 0 ? axisMax / plotH : 0;
+                const labels = [...host.querySelectorAll("text")]
+                  .map((t) => (t.textContent || "").trim())
+                  .filter((t) => /^[A-Z][a-z]{2}\s?\d{1,2}$/.test(t));
+                return {
+                  axisMax,
+                  labels: labels.slice(0, 40),
+                  points: rows.map((r) => ({
+                    v: scale ? Number((r.total * scale).toFixed(4)) : Number(r.total.toFixed(2)),
+                    raw: Number(r.total.toFixed(2)),
+                  })),
+                  peak: scale ? Number((maxPx * scale).toFixed(4)) : Number(maxPx.toFixed(2)),
+                  source: scale ? "axis-scaled" : "pixels",
+                };
+              });
+            } catch (e) {
+              earnLog("daily chart not readable: " + e.message);
+              return null;
+            }
+          }
+
+          /* Applies one date range and returns net revenue + cards + daily series. */
+          async function earnPickRange(page, start, end) {
+            await page.goto("https://upload.zedge.net", { waitUntil: "domcontentloaded" });
+            await page.waitForTimeout(6000);
+            await earnOpenCalendar(page);
+            await earnResetRange(page);
+            const sh = await earnShowMonth(page, start.y, start.m);
+            await earnClickDay(page, sh, start.d);
+            const eh = await earnShowMonth(page, end.y, end.m);
+            await earnClickDay(page, eh, end.d);
+            await earnApply(page);
+            return await earnPeriodValue(page);
+          }
+
+          async function earnRange(page, start, end) {
+            const wantStart = `${start.y}/${earnPad(start.m + 1)}/${earnPad(start.d)}`;
+            const wantEnd = `${end.y}/${earnPad(end.m + 1)}/${earnPad(end.d)}`;
+            let shown = "";
+            for (let attempt = 1; attempt <= 2; attempt++) {
+              shown = await earnPickRange(page, start, end);
+              if (shown.includes(wantStart) && shown.includes(wantEnd)) break;
+              earnLog(`attempt ${attempt}: picker applied "${shown}", expected ${wantStart} - ${wantEnd}`);
+              if (attempt === 2) { earnLog("range could not be set correctly - reading anyway"); }
+              await page.waitForTimeout(2000);
+            }
+            earnLog(`range applied: ${shown || "(unknown)"}`);
+            const got = await earnReadNetRevenue(page);
+            if (got) got.daily = await earnReadDaily(page);
+            earnLog(`${earnIso(start.y, start.m, start.d)} -> ${earnIso(end.y, end.m, end.d)} = ${got ? "$" + got.value + " (" + got.source + ")" : "not readable"}`);
+            return got;
+          }
+
+          /* This account's own Realtime Database - the same one the panel, the app and
+             the desktop client already read. No external service is involved. */
+          function earnDbUrl() {
+            try {
+              if (typeof firebaseDatabaseURL === "string" && firebaseDatabaseURL) {
+                return firebaseDatabaseURL.replace(/\/+$/, "");
+              }
+            } catch (e) {}
+            return (process.env.FIREBASE_DB_URL || "").trim().replace(/\/+$/, "");
+          }
+
+          async function earnPush(payload) {
+            const db = earnDbUrl();
+            if (!db) { earnLog("no Realtime Database url in this run - earnings not saved"); return; }
+            try {
+              const r = await fetch(`${db}/dashboardSettings/earnings.json`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+              });
+              earnLog(`saved to Firebase dashboardSettings/earnings (${r.status})`);
+              /* keep one snapshot per day so the panel can show a trend */
+              const dayKey = new Date(Date.now() + 6 * 3600 * 1000).toISOString().slice(0, 10);
+              await fetch(`${db}/dashboardSettings/earningsHistory/${dayKey}.json`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  date: dayKey,
+                  netRevenue: payload.netRevenue,
+                  mtdRevenue: payload.mtdRevenue,
+                  unlocks: payload.unlocks,
+                  users: payload.users,
+                  payoutExpected: payload.payoutExpected,
+                  updatedAt: payload.updatedAt,
+                }),
+              }).catch(() => {});
+            } catch (e) { earnLog("firebase save failed: " + e.message); }
+            await earnTelegram(payload);
+          }
+
+          /* Professional earnings card on Telegram, sent with every upload run. */
+          function earnEsc(s) {
+            return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+          }
+
+          function earnBar(part, total) {
+            const p = Math.max(0, Math.min(1, (Number(part) || 0) / (Number(total) || 1)));
+            const filled = Math.round(p * 10);
+            return "\u2588".repeat(filled) + "\u2591".repeat(10 - filled) + "  " + Math.round(p * 100) + "%";
+          }
+
+          async function earnTelegram(p) {
+            const money = (v) => (v == null || isNaN(v) ? "--" : "$" + Number(v).toFixed(2));
+            const num = (v) => (v == null || isNaN(v) ? "--" : Number(v).toLocaleString("en-US"));
+            const slash = (d) => (d ? String(d).replace(/-/g, "/") : "--");
+            const payable = p.mtdRevenue != null ? p.mtdRevenue : p.netRevenue;
+            const threshold = Number(p.threshold || 50);
+            const remaining = Math.max(0, threshold - (Number(payable) || 0));
+
+            const lines = [
+              "\uD83D\uDCCA <b>আর্নিং রিপোর্ট</b>",
+              "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
+              `\uD83D\uDCC1 <b>অ্যাকাউন্ট:</b> ${earnEsc(p.account || "Zedge")}`,
+              `\uD83D\uDDD3 <b>হিসাবের সময়কাল:</b> ${earnEsc(slash(p.periodStart))} \u2192 ${earnEsc(slash(p.periodEnd))}`,
+              "",
+              `\uD83D\uDD13 <b>আনলক:</b> ${num(p.unlocks)}`,
+              `\uD83D\uDC65 <b>ইউজার:</b> ${num(p.users)}`,
+              `\uD83D\uDCB5 <b>নেট রেভিনিউ:</b> ${money(p.netRevenue)}`,
+              `\uD83D\uDCB0 <b>এখন পাওনা:</b> ${money(payable)}`,
+              "",
+              `\uD83C\uDFAF <b>পেমেন্ট থ্রেশহোল্ড</b> (${money(threshold)})`,
+              `<code>${earnBar(payable, threshold)}</code>`,
+              p.payoutExpected
+                ? "\u2705 <b>থ্রেশহোল্ড পূর্ণ হয়েছে - এই সাইকেলেই পেমেন্ট আসার কথা।</b>"
+                : `\u23F3 পেমেন্ট পেতে আরও ${money(remaining)} দরকার।`,
+              "",
+              `\uD83E\uDDFE <b>সর্বশেষ পেমেন্ট:</b> ${p.lastPayment ? earnEsc(p.lastPayment) + " \u2022 " + money(p.lastPaymentAmount) : "এখনো কোনো পেমেন্ট পাওয়া যায়নি"}`,
+              p.lastPaymentDate ? `\uD83D\uDCC5 <b>পেমেন্টের তারিখ:</b> ${earnEsc(p.lastPaymentDate)}` : "",
+              p.dailyPeak ? `\uD83D\uDCC8 <b>সেরা দিনের আয়:</b> ${money(p.dailyPeak)}` : "",
+              "",
+              `\uD83D\uDD04 এই আপলোড রানের শেষে সংগ্রহ করা \u2022 বিস্তারিত রিপোর্ট ড্যাশবোর্ডে`,
+            ].filter(Boolean);
+
+            const text = lines.join("\n");
+            try {
+              if (typeof sendTelegramNotification === "function") {
+                await sendTelegramNotification(text);
+                earnLog("earnings report sent to Telegram");
+                return;
+              }
+              const token = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
+              const chatId = (process.env.TELEGRAM_CHAT_ID || "").trim();
+              if (!token || !chatId) { earnLog("Telegram skipped: token/chat id not set"); return; }
+              const api = "https://api.telegram.org/bot" + token + "/sendMessage";
+              const res = await fetch(api, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true }),
+              });
+              earnLog(`earnings report sent to Telegram (${res.status})`);
+            } catch (e) { earnLog("Telegram earnings report failed: " + e.message); }
+          }
+
+          /* Main entry - called once the publish run is finished. */
+          async function collectEarnings(page) {
+            const account = process.env.FOLDER_NAME || "Zedge";
+            const runUrl = process.env.GITHUB_SERVER_URL && process.env.GITHUB_REPOSITORY && process.env.GITHUB_RUN_ID
+              ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}` : "";
+            const nowDhaka = new Date(Date.now() + 6 * 3600 * 1000);
+            const curY = nowDhaka.getUTCFullYear(), curM = nowDhaka.getUTCMonth();
+
+            const last = await earnReadLastPayment(page);
+            /* start = the month right after the last payout; with no payment yet it is the
+               oldest month the Reports tab lists (fallback: January of this year) */
+            let sY = curY, sM = 0, startFrom = "january-fallback";
+            if (last) {
+              sY = last.m === 11 ? last.y + 1 : last.y;
+              sM = (last.m + 1) % 12;
+              startFrom = "after-last-payment";
+            } else {
+              const oldest = await earnReadReportsOldestMonth(page);
+              if (oldest) { sY = oldest.y; sM = oldest.m; startFrom = "oldest-reported-month"; }
+            }
+            earnLog(`range start rule: ${startFrom}`);
+
+            /* period 1: start month -> end of the previous month */
+            const pY = curM === 0 ? curY - 1 : curY, pM = (curM + 11) % 12;
+            const start = { y: sY, m: sM, d: 1 };
+            const prevEnd = { y: pY, m: pM, d: earnDaysInMonth(pY, pM) };
+
+            let closed = null, mtd = null;
+            if (sY * 12 + sM <= pY * 12 + pM) closed = await earnRange(page, start, prevEnd);
+            else earnLog("last payment already covers the previous month - closed period skipped");
+
+            const payout = !!(closed && closed.value >= EARN_THRESHOLD);
+            /* period 2: when the closed months are still under the threshold, include the running month */
+            if (!payout) {
+              const mEnd = { y: curY, m: curM, d: earnDaysInMonth(curY, curM) };
+              mtd = await earnRange(page, start, mEnd);
+            }
+
+            const shown = mtd || closed;
+            const cards = (shown && shown.cards) || null;
+            const daily = (shown && shown.daily) || null;
+
+            const payload = {
+              account,
+              currency: "USD",
+              lastPayment: last ? earnTitle(last.m, last.y) : "",
+              lastPaymentAmount: last ? last.amount : null,
+              lastPaymentDate: last ? last.paidOn || "" : "",
+              payments: last && last.payments ? last.payments : [],
+              periodStart: earnIso(start.y, start.m, start.d),
+              periodEnd: earnIso(prevEnd.y, prevEnd.m, prevEnd.d),
+              netRevenue: closed ? closed.value : null,
+              mtdStart: earnIso(start.y, start.m, start.d),
+              mtdEnd: earnIso(curY, curM, earnDaysInMonth(curY, curM)),
+              mtdRevenue: mtd ? mtd.value : (closed ? closed.value : null),
+              unlocks: cards ? cards.unlocks : null,
+              users: cards ? cards.users : null,
+              rangeStart: shown === mtd && mtd ? earnIso(start.y, start.m, start.d) : earnIso(start.y, start.m, start.d),
+              rangeEnd: shown === mtd && mtd ? earnIso(curY, curM, earnDaysInMonth(curY, curM)) : earnIso(prevEnd.y, prevEnd.m, prevEnd.d),
+              daily: daily ? daily.points.map((p) => p.v) : [],
+              dailyLabels: daily ? daily.labels : [],
+              dailyPeak: daily ? daily.peak : null,
+              dailySource: daily ? daily.source : "",
+              threshold: EARN_THRESHOLD,
+              payoutExpected: payout,
+              status: payout ? "payout expected" : "below threshold",
+              note: payout
+                ? `Closed months reached $${closed.value} (>= $${EARN_THRESHOLD}) - a payment is due this month.`
+                : `Closed months are $${closed ? closed.value : 0}; including the running month it is $${mtd ? mtd.value : 0} of $${EARN_THRESHOLD}.`,
+              runUrl,
+              source: closed ? closed.source : (mtd ? mtd.source : ""),
+              updatedAt: Date.now(),
+              updatedBy: "bot",
+            };
+            earnLog(JSON.stringify({ ...payload, daily: `${payload.daily.length} points` }));
+            await earnPush(payload);
+            return payload;
+          }
+
           const fs = require("fs");
           const path = require("path");
 
@@ -3738,6 +4288,14 @@ jobs:
 
               console.log(`\n🏁 Run complete. ${successCount} upload(s) succeeded.`);
 
+              /* MH-EARNINGS: read the payout state in this same browser */
+              try {
+                console.log("\n\uD83D\uDCB0 Collecting the Zedge earnings report...");
+                await collectEarnings(page);
+              } catch (earnErr) {
+                console.warn("\u26A0\uFE0F earnings report skipped: " + (earnErr && earnErr.message));
+              }
+
               // Save video recording before closing browser
               console.log("\n📹 Saving screen recording...");
               let savedVideoPath = "";
@@ -3863,6 +4421,9 @@ jobs:
           GATE_SLOTS: ${{ needs.gate.outputs.slots }}
           GATE_RETRY_SLOTS: ${{ needs.gate.outputs.retries }}
           UPLOADS_PER_RUN: ${{ needs.gate.outputs.count || '1' }}
+          # MH-EARNINGS: payout threshold in USD (the report is saved to this
+          # account's own Firebase: dashboardSettings/earnings)
+          EARN_THRESHOLD: "50"
 
         run: node bot.js
 
