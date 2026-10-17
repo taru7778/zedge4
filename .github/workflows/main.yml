@@ -865,6 +865,8 @@ jobs:
             const notes = [];
             if (!/^\s*DNS\s*=/mi.test(cfg)) { cfg = cfg.replace(/^\s*\[Interface\]\s*$/mi, "[Interface]\nDNS = 1.1.1.1, 8.8.8.8"); notes.push("DNS 1.1.1.1 added"); }
             if (!/AllowedIPs\s*=.*0\.0\.0\.0\/0/i.test(cfg)) notes.push("AllowedIPs does not cover 0.0.0.0/0 - only part of the traffic will use the tunnel");
+            // v40.7: keep the UDP path alive - without it NAT on the runner / VPN side can silently drop the tunnel mid-run
+            if (!/^\s*PersistentKeepalive\s*=/mi.test(cfg)) { cfg = cfg.replace(/^\s*\[Peer\]\s*$/mi, "[Peer]\nPersistentKeepalive = 25"); notes.push("PersistentKeepalive = 25 added"); }
             if (String(profile.extra || "").trim()) cfg += "\n" + String(profile.extra).replace(/\r\n?/g, "\n").trim();
             fs.writeFileSync(path.join(dir, `${WG_TUNNEL}.conf`), cfg + "\n", { mode: 0o600 });
             return notes;
@@ -1073,6 +1075,7 @@ jobs:
             setEnv("VPN_PROFILE_NAME", name);
             setEnv("VPN_KEEP_PROXY", data && data.keepProxy === true ? "1" : "0");
             setEnv("VPN_PUBLIC_IP", ipAfter.ip);
+            setEnv("VPN_REAL_IP", ipBefore && ipBefore.ip ? ipBefore.ip : "");   // v40.7: self-heal refuses to continue on this IP
             setOutput("vpn", type);
           }
 
@@ -1109,6 +1112,81 @@ jobs:
         run: |
           @'
           const { chromium } = require("playwright");
+          /* v40.7 VPN self-heal -------------------------------------------------------
+             A WireGuard / OpenVPN tunnel can die in the middle of a run (server drops the
+             session, the same key is used by another runner, UDP path lost...). Before
+             v40.7 every request after that just timed out (ERR_CONNECTION_TIMED_OUT) and
+             even the Telegram crash report could not go out. Now:
+               - page navigation retries, and if the internet is dead the tunnel is
+                 restarted and the public IP re-checked (never continues on the real IP)
+               - if the tunnel cannot be revived the run stops; the browser is closed
+                 first, then the dead tunnel is removed so the crash report still arrives.
+             ------------------------------------------------------------------------- */
+          const VPN_ON = process.env.VPN_ACTIVE === "1";
+          const VPN_WG_TUNNEL = "zedgewg";
+          const NET_ERR_RE = /net::ERR_(CONNECTION_TIMED_OUT|TIMED_OUT|CONNECTION_RESET|CONNECTION_CLOSED|CONNECTION_REFUSED|CONNECTION_ABORTED|NAME_NOT_RESOLVED|INTERNET_DISCONNECTED|NETWORK_CHANGED|ADDRESS_UNREACHABLE|EMPTY_RESPONSE|SOCKET_NOT_CONNECTED|TUNNEL_CONNECTION_FAILED|PROXY_CONNECTION_FAILED|NETWORK_IO_SUSPENDED)|Timeout \d+ms exceeded/i;
+          const vpnSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          async function netProbe(ms = 8000) {
+            for (const u of ["https://www.gstatic.com/generate_204", "https://cloudflare.com/cdn-cgi/trace"]) {
+              try { const r = await fetch(u, { signal: AbortSignal.timeout(ms) }); if (r.status === 204 || r.ok) return true; } catch (_) {}
+            }
+            return false;
+          }
+          async function vpnPublicIp() {
+            for (const u of ["https://api.ipify.org?format=json", "https://ipwho.is/"]) {
+              try { const r = await fetch(u, { signal: AbortSignal.timeout(10000) }); const j = await r.json(); if (j && j.ip) return String(j.ip); } catch (_) {}
+            }
+            return "";
+          }
+          function vpnPs(cmd, ms = 60000) {
+            const { spawnSync } = require("child_process");
+            const r = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", cmd], { encoding: "utf8", timeout: ms, windowsHide: true });
+            return { code: r.status, out: String(r.stdout || "") + String(r.stderr || "") };
+          }
+          let vpnHealCount = 0;
+          let vpnDropped = false;
+          async function vpnHeal(reason) {
+            if (!VPN_ON) return false;
+            vpnDropped = true;
+            if (vpnHealCount >= 3) { console.log("🩺 VPN self-heal: already tried 3 times - giving up"); return false; }
+            vpnHealCount++;
+            console.log(`🩺 Internet is not reachable (${String(reason).slice(0, 120)}) - VPN self-heal #${vpnHealCount} (${process.env.VPN_TYPE || "?"} · ${process.env.VPN_PROFILE_NAME || "?"})`);
+            if (process.platform === "win32" && process.env.VPN_TYPE === "wireguard") {
+              const r = vpnPs(`Restart-Service -Name 'WireGuardTunnel$${VPN_WG_TUNNEL}' -Force -ErrorAction Stop; 'ok'`, 90000);
+              console.log(`   · WireGuard tunnel service restart: ${r.code === 0 ? "ok" : "failed - " + r.out.trim().slice(-200)}`);
+            }
+            const deadline = Date.now() + 75000;
+            let up = false;
+            while (Date.now() < deadline) { if (await netProbe(6000)) { up = true; break; } await vpnSleep(3000); }
+            if (!up) { console.log("   · ❌ still no internet through the VPN tunnel"); return false; }
+            const ip = await vpnPublicIp();
+            const real = process.env.VPN_REAL_IP || "", want = process.env.VPN_PUBLIC_IP || "";
+            if (!ip) { console.log("   · ❌ public IP could not be checked"); return false; }
+            if ((real && ip === real) || (!real && want && ip !== want)) {
+              throw new Error(`VPN self-heal: public IP is now ${ip} (VPN IP was ${want || "?"}) - stopping so the real IP is never used`);
+            }
+            console.log(`   · ✅ VPN tunnel is back - public IP ${ip}${want && ip !== want ? " (new VPN exit IP, was " + want + ")" : ""}`);
+            return true;
+          }
+          function vpnDown() {
+            if (!VPN_ON || process.platform !== "win32") return;
+            if (process.env.VPN_TYPE === "wireguard") vpnPs(`& 'C:\\Program Files\\WireGuard\\wireguard.exe' /uninstalltunnelservice ${VPN_WG_TUNNEL}`, 60000);
+            else vpnPs("Get-Process openvpn -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue", 30000);
+          }
+          async function gotoSafe(page, url, opts = {}) {
+            for (let attempt = 1; ; attempt++) {
+              try { return await page.goto(url, opts); }
+              catch (e) {
+                const msg = String((e && e.message) || e).split("\n")[0];
+                if (attempt >= 3 || !NET_ERR_RE.test(msg)) throw e;
+                console.log(`⚠️ Could not open ${url} (${msg}) - attempt ${attempt}/3`);
+                if (await netProbe()) { await vpnSleep(5000 * attempt); continue; }
+                if (!VPN_ON) { await vpnSleep(20000); continue; }
+                await page.goto("about:blank").catch(() => {});   // nothing talks to Zedge while the tunnel restarts
+                if (!(await vpnHeal(msg))) throw e;
+              }
+            }
+          }
 
           /* ------------------------------------------------------------------ */
           /* MH-EARNINGS v35.1 - synced with Chrome extension v1.6.0 + series     */
@@ -1173,7 +1251,7 @@ jobs:
             for (let attempt = 1; attempt <= 3; attempt++) {
               earnLog(`opening the portal home (attempt ${attempt}/3)`);
               try {
-                await page.goto(EARN_HOME, { waitUntil: "domcontentloaded", timeout: 60000 });
+                await gotoSafe(page, EARN_HOME, { waitUntil: "domcontentloaded", timeout: 60000 });
                 await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => {});
               } catch (e) { earnLog("portal home goto failed: " + e.message); }
               for (let w = 0; w < 30; w++) {
@@ -4685,14 +4763,14 @@ jobs:
 
               // 3. BrowserLeaks check ONCE
               console.log("Opening BrowserLeaks");
-              await page.goto("https://browserleaks.com/ip", { waitUntil: "domcontentloaded" });
+              await gotoSafe(page, "https://browserleaks.com/ip", { waitUntil: "domcontentloaded" });
               await page.waitForLoadState("networkidle");
               await scrollFullPage(page);
               await page.evaluate(() => window.scrollTo(0, 0));
 
               // 4. Login ONCE
               console.log("Opening Zedge");
-              await page.goto("https://upload.zedge.net", { waitUntil: "domcontentloaded" });
+              await gotoSafe(page, "https://upload.zedge.net", { waitUntil: "domcontentloaded" });
               await page.waitForLoadState("networkidle");
               await page.waitForTimeout(2000);
 
@@ -4953,7 +5031,7 @@ jobs:
                 try {
                   // Navigate back to Zedge portal for each upload
                   console.log("Navigating to Zedge upload portal");
-                  await page.goto("https://upload.zedge.net", { waitUntil: "domcontentloaded" });
+                  await gotoSafe(page, "https://upload.zedge.net", { waitUntil: "domcontentloaded" });
                   await page.waitForLoadState("networkidle");
 
                   // Click Profiles tab
@@ -5029,7 +5107,7 @@ jobs:
                   const targetType = ZEDGE_TYPE_URLS[itemCType] || (queueItem.isMp3 ? "AUDIO" : "WALLPAPER");
                   const targetContentUrl = `${profileBase}/content/${targetType}`;
                   console.log(`Navigating directly to ${targetType} page: ${targetContentUrl}`);
-                  await page.goto(targetContentUrl, { waitUntil: "domcontentloaded" });
+                  await gotoSafe(page, targetContentUrl, { waitUntil: "domcontentloaded" });
                   await page.waitForLoadState("networkidle");
                   await page.waitForTimeout(1000);
 
@@ -5259,6 +5337,21 @@ jobs:
 
             } catch (err) {
               console.error("BOT FATAL ERROR:", err);
+              // v40.7: if the VPN tunnel died, close the browser first, then revive / remove the tunnel
+              // so the gate report + Telegram crash message can still go out (no Zedge traffic is left).
+              let netDead = false;
+              try {
+                if (!(await netProbe(8000))) {
+                  netDead = true;
+                  if (VPN_ON) {
+                    try { if (context) await context.close(); } catch (_) {}
+                    try { if (browser) await browser.close(); } catch (_) {}
+                    let healed = false;
+                    try { healed = await vpnHeal("fatal: " + String((err && err.message) || err).split("\n")[0]); } catch (e2) { console.log(e2.message); }
+                    if (!healed) { console.log("🔌 VPN tunnel is dead - browser already closed, removing the tunnel so the crash report can be sent"); vpnDown(); await vpnSleep(4000); }
+                  }
+                }
+              } catch (_) {}
               // v27.11: every slot this run had not finished is reported as failed -> the gate retries it
               await markRemainingGateSlots(0, { status: "failed", error: ("fatal: " + String((err && err.message) || err || "unknown")).replace(/\s+/g, " ").slice(0, 200) }).catch(() => {});
               // Notify user of fatal crash before exiting
@@ -5272,10 +5365,11 @@ jobs:
                   `📁 প্রজেক্ট: ${tgEscape(crashFolder)}`,
                   `📝 অবস্থা: রান চলাকালে মারাত্মক ত্রুটি — রান বন্ধ হয়ে গেছে।`,
                   `🧩 ত্রুটি: <code>${crashSnippet}</code>`,
+                  vpnDropped || (netDead && VPN_ON) ? `🔐 কারণ: রানের মাঝে VPN সংযোগ (${tgEscape(process.env.VPN_PROFILE_NAME || "")}) বিচ্ছিন্ন হয়ে গিয়েছিল — আবার চালু করা যায়নি।` : "",
                   `🕒 সময়: ${fmtDhakaTime()}`,
                   "",
                   "🔎 GitHub Actions লগ দেখুন। ক্র্যাশ রেকর্ডিং থাকলে পরের মেসেজে পাবেন।"
-                ].join("\n");
+                ].filter((x) => x !== "").join("\n");
                 await sendTelegramNotification(fatalMsg);
               } catch (_) {}
 
@@ -5311,6 +5405,7 @@ jobs:
           VPN_TYPE: ${{ env.VPN_TYPE }}
           VPN_PROFILE_NAME: ${{ env.VPN_PROFILE_NAME }}
           VPN_PUBLIC_IP: ${{ env.VPN_PUBLIC_IP }}
+          VPN_REAL_IP: ${{ env.VPN_REAL_IP }}
           VPN_KEEP_PROXY: ${{ env.VPN_KEEP_PROXY }}
           PROXY_SERVER: ${{ github.event.inputs.proxy_server }}
           PROXY_USER: ${{ github.event.inputs.proxy_user }}
