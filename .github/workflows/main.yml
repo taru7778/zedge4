@@ -88,12 +88,13 @@ jobs:
         id: decide
         shell: bash
         env:
-          # v28 security: database URL comes from GitHub Secrets (GitHub > Settings > Secrets and variables > Actions)
-          FIREBASE_DB_URL: ${{ secrets.ZEDGE4_DB_URL }}
-          R2_WORKER_URL: ${{ secrets.R2_WORKER_URL }}
           # v27.11: the gate reports a missed slot to Telegram as well (same bot / chat as the upload reports)
+          # v28 security: NOTHING secret is written in this file any more. Bot token / chat id / database URL
+          # come from GitHub Secrets (GitHub > Settings > Secrets and variables > Actions).
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FIREBASE_DB_URL: ${{ secrets.ZEDGE4_DB_URL }}
+          R2_WORKER_URL: ${{ secrets.R2_WORKER_URL }}
           # v27.11.1: passed via env - a `${{ }}` inside this big run block made GitHub reject the workflow
           # ("Exceeded max expression length 21000"); env values are not subject to that limit.
           FORCE_RUN: ${{ inputs.force_run }}
@@ -120,7 +121,7 @@ jobs:
           const DB = (process.env.FIREBASE_DB_URL || "").trim().replace(/\/+$/, "");
           if (!DB) { console.log("::error::GitHub secret ZEDGE4_DB_URL is missing - set it in GitHub > Settings > Secrets and variables > Actions"); process.exit(1); }
           const ACCOUNT = "ZEDGE4";
-          const DEFAULT_WINDOWS = [5, 11, 17];   // window start hours (Asia/Dhaka) - fallback only
+          const DEFAULT_WINDOWS = [11, 17, 21];   // window start hours (Asia/Dhaka) - fallback only
           const WINDOW_HOURS = 3;                      // each window lasts 3 hours
           const SLOT_MIN = 30;                         // scheduler pings every 30 min
           const RUN_ID = process.env.GITHUB_RUN_ID || "";
@@ -2448,7 +2449,7 @@ jobs:
 
           async function earnViaExtension(page) {
             const code = Buffer.from(EARN_EXT_B64, "base64").toString("utf8");
-            const opts = { account: process.env.FOLDER_NAME || "Zedge", threshold: EARN_THRESHOLD };
+            const opts = { account: zAccountLabel("Zedge"), threshold: EARN_THRESHOLD };
             const onConsole = (msg) => {
               const t = msg.text() || "";
               if (t.indexOf("[MH earnings]") === 0) earnLog("ext: " + t.slice(14));
@@ -2533,7 +2534,7 @@ jobs:
 
           /* Main entry - called once the publish run is finished. */
           async function collectEarnings(page) {
-            const account = process.env.FOLDER_NAME || "Zedge";
+            const account = zAccountLabel("Zedge");
             const runUrl = process.env.GITHUB_SERVER_URL && process.env.GITHUB_REPOSITORY && process.env.GITHUB_RUN_ID
               ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}` : "";
             const nowDhaka = new Date(Date.now() + 6 * 3600 * 1000);
@@ -2771,9 +2772,10 @@ jobs:
           }
 
           async function sendTelegramNotification(message) {
+            // v28 security: bot token + chat id come from GitHub Secrets (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)
             const token = process.env.TELEGRAM_BOT_TOKEN || "";
             const chatId = process.env.TELEGRAM_CHAT_ID || "";
-            if (!token || !chatId) { console.log("Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secrets missing) - skipping notification."); return; }
+            if (!token || !chatId) { console.log("Telegram skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secret not set"); return; }
             try {
               const url = `https://api.telegram.org/bot${token}/sendMessage`;
               const res = await fetch(url, {
@@ -2891,9 +2893,10 @@ jobs:
           }
 
           async function sendTelegramAttachment(filePath, type = "image", caption = "", extra = {}) {
+            // v28 security: bot token + chat id come from GitHub Secrets (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)
             const token = process.env.TELEGRAM_BOT_TOKEN || "";
             const chatId = process.env.TELEGRAM_CHAT_ID || "";
-            if (!token || !chatId) { console.log("Telegram not configured - skipping attachment."); return; }
+            if (!token || !chatId) { console.log("Telegram skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secret not set"); return; }
             try {
               if (!fs.existsSync(filePath)) {
                 console.log(`Telegram attachment file not found: ${filePath}`);
@@ -2950,6 +2953,449 @@ jobs:
             }
           }
 
+          // ═══════════════════════════════════════════════════════════════════════════════════════════
+          // v30 API ONLY - login + profile + upload via Zedge backend requests (tested in Zedge API Tester ext.)
+          //   login : account.zedge.net/v2/auth/password/authorize -> redirect -> upload.zedge.net/auth/token
+          //   upload: api-gateway-v2.zedge.net GraphQL (create -> cover/variants -> meta+publish -> status -> archive)
+          //   Requests go through Playwright context.request = same cookies, same User-Agent and the SAME proxy as the
+          //   browser (Playwright passes the browser/context proxy to it); the VPN tunnel is system-wide, so it covers
+          //   these requests too. x-geoipcountry follows the exit IP country (VPN/proxy), like the real site.
+          //   No UI login / UI upload: everything is done with requests. Optional variable ZEDGE_GEO_COUNTRY (e.g. US).
+          // ═══════════════════════════════════════════════════════════════════════════════════════════
+          const ZEDGE_GQL = "https://api-gateway-v2.zedge.net/";
+          const Z_NET_ERR = /ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|socket hang up|Timeout \d+ms exceeded|net::ERR_|\(HTTP 0\)/i;
+          const Z_AUTH_ERR = /Authentication object was not found|unauthori[sz]ed|jwt|token (is )?(expired|invalid)/i;
+          const zApi = { ctx: null, country: null, token: null, expiresAt: 0, sessionId: null, cats: {}, ready: false, businessId: null, businessName: null, profiles: null, cur: null, email: null };
+
+          function zSleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+          function zReq() { if (!zApi.ctx) throw new Error("API: browser context not ready"); return zApi.ctx.request; }
+
+          async function zApiToken(force) {
+            if (!force && zApi.token && Date.now() < zApi.expiresAt - 90 * 1000) return zApi.token;
+            let res = null, body = null;
+            for (let i = 1; i <= 3; i++) {
+              res = await zReq().post("https://upload.zedge.net/auth/token", {
+                data: { scope: "user" }, timeout: 30000,
+                headers: { "content-type": "application/json", origin: "https://upload.zedge.net", referer: "https://upload.zedge.net/" }
+              }).catch((e) => ({ status: () => 0, json: async () => null, _e: e }));
+              body = await res.json().catch(() => null);
+              if (body && body.accessToken) break;
+              await zSleep(1500 * i);
+            }
+            if (!body || !body.accessToken) throw new Error("API: /auth/token gave no accessToken (HTTP " + res.status() + ") - not logged in?");
+            zApi.token = body.accessToken;
+            const exp = Number(body.expiresAt) || 0;                           // seconds
+            zApi.expiresAt = exp ? (exp < 1e12 ? exp * 1000 : exp) : Date.now() + 10 * 60 * 1000;
+            if (!zApi.sessionId) zApi.sessionId = require("crypto").randomBytes(24).toString("base64").replace(/[^A-Za-z0-9]/g, "").slice(0, 32);
+            console.log("API token ready (valid ~" + Math.round((zApi.expiresAt - Date.now()) / 60000) + " min)");
+            return zApi.token;
+          }
+
+          // x-geoipcountry = country of the CURRENT exit IP (VPN / proxy / runner) - the Zedge site sends the country
+          // its server saw for the request, so a VPN in US must say "US", never a hard-coded "BD".
+          async function zDetectCountry() {
+            if (process.env.ZEDGE_GEO_COUNTRY) { zApi.country = String(process.env.ZEDGE_GEO_COUNTRY).trim().toUpperCase(); return zApi.country; }
+            const providers = [
+              ["https://ipwho.is/", (d) => d.country_code],
+              ["https://ipinfo.io/json", (d) => d.country],
+              ["http://ip-api.com/json", (d) => d.countryCode]
+            ];
+            for (const [u, f] of providers) {
+              try {
+                const r = await zReq().get(u, { timeout: 15000 });
+                const d = await r.json();
+                const c = String(f(d) || "").trim().toUpperCase();
+                if (/^[A-Z]{2}$/.test(c)) { zApi.country = c; console.log(`API geo: exit IP country ${c} (${u})`); return c; }
+              } catch (_) {}
+            }
+            console.log("API geo: country lookup failed - x-geoipcountry header left out");
+            zApi.country = null; return null;
+          }
+
+          // Login with requests only (no clicks). Returns {email}. err.badCredentials=true 
+          async function zApiLogin(context, email, password) {
+            zApi.ctx = context;
+            const req = context.request;
+            if (!zApi.country) await zDetectCountry();
+            const H = { "content-type": "application/json", accept: "*/*", origin: "https://account.zedge.net", referer: "https://account.zedge.net/v2/login-with-email" };
+            const t0 = Date.now();
+            await req.get("https://account.zedge.net/v2/login?scope=ZEDGE", { timeout: 45000 }).catch((e) => console.log("API login: login page GET failed (" + e.message + ") - continuing"));
+            const v = await req.post("https://account.zedge.net/v2/auth/email/verify-request", { data: { email }, headers: H, timeout: 30000 });
+            const vj = await v.json().catch(() => null);
+            const next = vj && vj.error && vj.error.nextAction;
+            console.log("API login · verify-request: HTTP " + v.status() + (next ? " · nextAction " + next : ""));
+            if (next && next !== "LOGIN") { const e = new Error("API login: account not ready for password login (nextAction " + next + ")"); e.badCredentials = /REGISTER|SIGNUP/i.test(next); throw e; }
+            await zSleep(600 + Math.floor(Math.random() * 900));             // human-ish gap between email and password step
+            const a = await req.post("https://account.zedge.net/v2/auth/password/authorize", { data: { username: email, password }, headers: H, timeout: 30000 });
+            const aj = await a.json().catch(() => null) || {};
+            console.log("API login · password/authorize: HTTP " + a.status() + (aj.redirectUrl ? " · redirect " + aj.redirectUrl : "") + (aj.error ? " · " + (aj.error.detail || aj.error.title || "error") : ""));
+            if (aj.error || a.status() >= 400) {
+              const e = new Error("API login failed: " + ((aj.error && (aj.error.detail || aj.error.title)) || ("HTTP " + a.status())));
+              e.badCredentials = a.status() === 400 || a.status() === 401 || /password|credential|invalid|incorrect/i.test(e.message);
+              throw e;
+            }
+            let target = aj.redirectUrl || "https://upload.zedge.net/";
+            try { target = new URL(target, "https://account.zedge.net").href; } catch (_) {}
+            const g = await req.get(target, { timeout: 45000 }).catch((e) => { console.log("API login: redirect GET failed (" + e.message + ")"); return null; });
+            if (g) console.log("API login · redirect GET -> HTTP " + g.status() + " " + g.url());
+            await zApiToken(true);
+            const ui = await req.get("https://upload.zedge.net/auth/user-info?scope=user", { timeout: 30000 }).then((r) => r.json()).catch(() => null);
+            zApi.email = (ui && ui.email) || email;
+            zApi.ready = true;
+            console.log(`✅ API login OK in ${Date.now() - t0}ms (account ${zApi.email})`);
+            return { email: zApi.email };
+          }
+
+          // After a UI login the cookies are in the same context -> just fetch a token.
+          async function zApiAttach(context) {
+            zApi.ctx = context;
+            if (!zApi.country) await zDetectCountry();
+            await zApiToken(true);
+            zApi.ready = true;
+          }
+
+          function zApiHeaders() {
+            const h = {
+              authorization: "Bearer " + zApi.token,
+              "x-auth-v2": "true",
+              "x-session-id": zApi.sessionId,
+              "x-request-id": require("crypto").randomUUID(),
+              origin: "https://upload.zedge.net",
+              referer: "https://upload.zedge.net/"
+            };
+            if (zApi.country) h["x-geoipcountry"] = zApi.country;
+            return h;
+          }
+
+          // v41.3: generic GraphQL input fixer. Reads "$input got invalid value" errors and patches the input (also nested, e.g. paymentLock).
+          function zFixInput(input, msg) {
+            if (!input || !msg) return [];
+            const notes = [];
+            const dflt = (t, f) => /^\[/.test(t) ? [] : /^Boolean/.test(t) ? false : /^(Int|Float)/.test(t) ? 0 : /^String/.test(t) ? ""
+              : /Input!?$/.test(t) ? {} : /lock/i.test(t + " " + f) ? "VIDEO" : undefined;
+            const walk = (o, keys) => { for (const k of keys) { if (!o || typeof o !== "object") return null; if (!(k in o) || o[k] === null || typeof o[k] !== "object") o[k] = {}; o = o[k]; } return o; };
+            const findOwner = (o, key) => { if (!o || typeof o !== "object") return null; if (key in o) return o; for (const v of Object.values(o)) { const r = v && typeof v === "object" && !Array.isArray(v) ? findOwner(v, key) : null; if (r) return r; } return null; };
+            for (const seg of msg.split(/;\s*(?=Variable "\$input")/)) {
+              const pm = /at "input((?:\.\w+)*)"/.exec(seg), path = pm && pm[1] ? pm[1].slice(1).split(".") : [];
+              let m;
+              if ((m = /Field "(\w+)" is not defined by type "(\w+)"(?:\. Did you mean "(\w+)")?/.exec(seg))) {
+                const o = path.length ? walk(input, path) : findOwner(input, m[1]);
+                if (o && m[1] in o) { const v = o[m[1]]; delete o[m[1]]; if (m[3] && !(m[3] in o)) { o[m[3]] = v; notes.push(`${m[1]} -> ${m[3]}`); } else notes.push(`-${m[1]}`); }
+              } else if ((m = /Field "(\w+)" of required type "([^"]+)" was not provided/.exec(seg))) {
+                const o = walk(input, path), d = dflt(m[2], m[1]);
+                if (o && !(m[1] in o) && d !== undefined) { o[m[1]] = d; notes.push(`+${path.concat(m[1]).join(".")}=${JSON.stringify(d)}`); }
+              } else if (path.length) {
+                const key = path[path.length - 1], o = walk(input, path.slice(0, -1));
+                if (o && key in o) {
+                  const sug = /Did you mean the enum value "(\w+)"/.exec(seg), nn = /non-nullable type "([^"]+)"/.exec(seg);
+                  const old = JSON.stringify(o[key]);
+                  if (sug) o[key] = sug[1];
+                  else if (nn && dflt(nn[1], key) !== undefined) o[key] = dflt(nn[1], key);
+                  else if (key === "categoryId" && typeof o[key] === "number") o[key] = String(o[key]);
+                  else delete o[key];
+                  if (JSON.stringify(o[key]) !== old) notes.push(`${path.join(".")}=${JSON.stringify(o[key])}`);
+                }
+              }
+            }
+            return notes;
+          }
+
+          // one GraphQL call. files = [{ path: "variables.file", local: "C:/x.jpg" }] -> multipart (GraphQL upload spec)
+          async function zGql(label, query, variables, files, tries) {
+            tries = tries || 3;
+            variables = JSON.parse(JSON.stringify(variables || {}));
+            let lastErr, zFix = 0;
+            for (let i = 1; i <= tries; i++) {
+              try {
+                await zApiToken(false);
+                const t0 = Date.now();
+                const opts = { headers: zApiHeaders(), timeout: files ? 10 * 60 * 1000 : 60 * 1000 };
+                if (files && files.length) {
+                  // built by hand: the GraphQL multipart spec needs "operations" and "map" BEFORE the files
+                  // (Playwright's multipart option puts files first -> "Misordered multipart fields")
+                  const map = {};
+                  files.forEach((f, k) => { map[String(k + 1)] = [f.path]; });
+                  const boundary = "----WebKitFormBoundary" + require("crypto").randomBytes(12).toString("base64").replace(/[^A-Za-z0-9]/g, "").slice(0, 16);
+                  const parts = [];
+                  const field = (name, val) => parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${val}\r\n`, "utf8"));
+                  field("operations", JSON.stringify({ query, variables }));
+                  field("map", JSON.stringify(map));
+                  files.forEach((f, k) => {
+                    const ext = path.extname(f.local).toLowerCase();
+                    const mime = { ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm", ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".m4r": "audio/mp4", ".aac": "audio/aac", ".wav": "audio/wav", ".ogg": "audio/ogg" }[ext] || "application/octet-stream";
+                    const fname = path.basename(f.local).replace(/"/g, "");
+                    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${k + 1}"; filename="${fname}"\r\nContent-Type: ${mime}\r\n\r\n`, "utf8"));
+                    parts.push(fs.readFileSync(f.local));
+                    parts.push(Buffer.from("\r\n", "utf8"));
+                  });
+                  parts.push(Buffer.from(`--${boundary}--\r\n`, "utf8"));
+                  opts.headers["content-type"] = "multipart/form-data; boundary=" + boundary;
+                  opts.data = Buffer.concat(parts);
+                } else {
+                  opts.headers["content-type"] = "application/json";
+                  opts.data = JSON.stringify({ query, variables });
+                }
+                const res = await zReq().post(ZEDGE_GQL, opts);
+                const st = res.status();
+                const body = await res.json().catch(() => null);
+                if (st === 401 || st === 403) { zApi.token = null; throw new Error("HTTP " + st + " (auth)"); }
+                if (!body) throw new Error("HTTP " + st + " (no JSON)");
+                if (body.errors && body.errors.length) {
+                  const msg = body.errors.map((e) => e.message).join("; ");
+                  // unknown input field (e.g. limitedEdition not in ChargeScreenMetaAsUserInput) -> drop it and retry at once
+                  // v41.3: invalid input -> auto-fix (unknown field / rename / required missing / nested paymentLock), then retry
+                  if (/got invalid value/.test(msg)) console.log(`API ${label}: full validation error -> ${msg}`);
+                  if (variables.input && zFix < 8) {
+                    const fx = zFixInput(variables.input, msg);
+                    if (fx.length) { zFix++; console.log(`API ${label}: input fixed [${fx.join(", ")}] -> ${JSON.stringify(variables.input)}, retrying`); i--; continue; }
+                  }
+                  // short reason for Telegram: drop the echoed input object, keep the real cause
+                  const short = msg.replace(/got invalid value [\s\S]*?;\s*(?=(Field|Expected|Value|In field|Int|Float|String|Boolean|ID)\b)/g, "invalid -> ");
+                  const err = new Error(short);
+                  if (Z_AUTH_ERR.test(msg)) { zApi.token = null; console.log(`API ${label}: token expired/invalid -> new token`); }
+                  else err.noRetry = true;                                    // validation / business errors: don't hammer
+                  throw err;
+                }
+                console.log(`API ${label}: OK in ${Date.now() - t0}ms`);
+                return body.data;
+              } catch (e) {
+                lastErr = e;
+                console.log(`API ${label}: try ${i}/${tries} failed - ${e.message}`);
+                if (e.noRetry) break;
+                // v31: network error through a dead VPN tunnel -> same self-heal as gotoSafe (v40.7), then retry
+                if (Z_NET_ERR.test(String(e && e.message)) && !(await netProbe())) {
+                  if (VPN_ON && !(await vpnHeal("API " + label + ": " + String(e.message).split("\n")[0]))) throw e;
+                  if (!VPN_ON) await zSleep(20000);
+                }
+                await zSleep(2500 * i);
+              }
+            }
+            throw lastErr;
+          }
+
+          // ---- profiles: same list + order as the Zedge "Profiles" page (profilesAsUser size 1000) ----
+          async function zApiLoadProfiles() {
+            const b = await zGql("businesses", "query businesses { r: businessesAsUser { id businessName } }");
+            const biz = (b && b.r) || [];
+            if (!biz.length) throw new Error("API: no business on this account");
+            zApi.businessId = biz[0].id; zApi.businessName = biz[0].businessName;
+            const p = await zGql("profiles", "query profiles($businessId: ID!, $filters: ProfilesFilterInputAsUser) { r: profilesAsUser(businessId: $businessId, filters: $filters) { items { id businessId type name status } total } }",
+              { businessId: zApi.businessId, filters: { page: 1, size: 1000 } });
+            zApi.profiles = ((p && p.r && p.r.items) || []).map((x, i) => ({ ...x, index: i }));
+            console.log(`API profiles (${zApi.businessName}): ` + zApi.profiles.map((x) => `#${x.index + 1} ${x.name} [${x.status}] ${x.id}`).join(" | "));
+            return zApi.profiles;
+          }
+          // v41: Zedge business name -> Firebase dashboardSettings/account (panel / apps show it next to the Z1..Z4 tag)
+          function zAccountTag() { const m = String(process.env.FOLDER_NAME || "").match(/(\d+)\s*$/); return m ? "Z" + m[1] : ""; }
+          function zAccountLabel(fallback) {
+            const base = process.env.FOLDER_NAME || fallback || "Zedge";
+            return zApi.businessName ? `${zApi.businessName} · ${base}` : base;
+          }
+          async function zApiBusiness() {
+            if (zApi.businessName) return zApi.businessName;
+            try {
+              await zApiToken(false);
+              const r = await zReq().post(ZEDGE_GQL, { headers: { ...zApiHeaders(), "content-type": "application/json" }, data: JSON.stringify({ query: "query businesses { r: businessesAsUser { id businessName } }" }), timeout: 30000 });
+              const j = await r.json().catch(() => null);
+              const b = j && j.data && j.data.r && j.data.r[0];
+              if (b) { zApi.businessId = b.id; zApi.businessName = b.businessName; }
+            } catch (e) { console.log("API business name lookup failed: " + e.message); }
+            return zApi.businessName;
+          }
+          async function zSaveAccountInfo() {
+            const db = earnDbUrl();
+            if (!db || !zApi.businessName) return;
+            const info = { businessName: zApi.businessName, businessId: zApi.businessId || null, email: zApi.email || null, label: process.env.FOLDER_NAME || null, tag: zAccountTag() || null, updatedAt: Date.now() };
+            if (zApi.profiles) info.profiles = zApi.profiles.map((p) => ({ name: p.name, status: p.status || null, type: p.type || null }));
+            try {
+              const r = await fetch(`${db}/dashboardSettings/account.json`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(info) });
+              console.log(`🏷️ Account name "${zApi.businessName}" saved to Firebase dashboardSettings/account (${r.status})`);
+            } catch (e) { console.log("account info save failed: " + e.message); }
+          }
+          function zProfileUrl(pr) { return `https://upload.zedge.net/business/${pr.businessId || zApi.businessId}/profiles/${pr.id}`; }
+
+          // Zedge type -> API ops (strings from the upload.zedge.net bundle + HARs)
+          const Z_API_TYPES = {
+            WALLPAPER:      { kind: "single", cat: "WALLPAPER", create: "wallpaperCreate($profileId: ID!, $file: Upload!) { r: wallpaperCreateAsUser(profileId: $profileId, file: $file) { id } }",
+                              meta: "wallpaperMetaUpdateAndPublish($profileId: ID!, $id: ID!, $input: WallpaperMetaAsUserInput!) { r: wallpaperMetaUpdateAndPublishAsUser(profileId: $profileId, wallpaperId: $id, input: $input) { id } }",
+                              get: "wallpaper($profileId: ID!, $id: ID!) { r: wallpaperAsUser(profileId: $profileId, wallpaperId: $id) { id status statusMessage } }", limitedEdition: true,
+                              fold: "wallpaperLandscapeImageUpload($profileId: ID!, $wallpaperId: ID!, $file: Upload!) { r: wallpaperSetLandscapeImageAsUser(profileId: $profileId, wallpaperId: $wallpaperId, file: $file) { id landscapeImageUrl } }" },
+            AUDIO:          { kind: "single", cat: "AUDIO", create: "ringtoneCreate($profileId: ID!, $file: Upload!, $enrich: Boolean) { r: ringtoneCreateAsUser(profileId: $profileId, file: $file, enrich: $enrich) { id } }",
+                              meta: "ringtoneMetaUpdateAndPublish($profileId: ID!, $id: ID!, $input: RingtoneMetaAsUserInput!) { r: ringtoneMetaUpdateAndPublishAsUser(profileId: $profileId, ringtoneId: $id, input: $input) { id status statusMessage } }",
+                              get: "ringtone($profileId: ID!, $id: ID!) { r: ringtoneAsUser(profileId: $profileId, ringtoneId: $id) { id status statusMessage } }", enrich: true },
+            LIVE_WALLPAPER: { kind: "single", cat: "LIVE_WALLPAPER", create: "liveWallpaperCreate($profileId: ID!, $file: Upload!) { r: liveWallpaperCreateAsUser(profileId: $profileId, file: $file) { id } }",
+                              cover: "liveWallpaperCoverImageUpload($profileId: ID!, $input: LiveWallpaperCoverImageUploadAsUserInput!) { r: liveWallpaperCoverImageUploadAsUser(profileId: $profileId, input: $input) { id } }", coverKey: "liveWallpaperId",
+                              meta: "liveWallpaperMetaUpdateAndPublish($profileId: ID!, $id: ID!, $input: LiveWallpaperMetaAsUserInput!) { r: liveWallpaperMetaUpdateAndPublishAsUser(profileId: $profileId, liveWallpaperId: $id, input: $input) { id } }",
+                              get: "liveWallpaper($profileId: ID!, $id: ID!) { r: liveWallpaperAsUser(profileId: $profileId, liveWallpaperId: $id) { id status statusMessage } }", limitedEdition: true },
+            CHARGE_SCREEN:  { kind: "single", cat: "CHARGE_SCREEN", create: "chargeScreenCreate($profileId: ID!, $file: Upload!) { r: chargeScreenCreateAsUser(profileId: $profileId, file: $file) { id } }",
+                              cover: "chargeScreenCoverImageUpload($profileId: ID!, $input: ChargeScreenCoverImageUploadAsUserInput!) { r: chargeScreenCoverImageUploadAsUser(profileId: $profileId, input: $input) { id } }", coverKey: "chargeScreenId",
+                              meta: "chargeScreenMetaUpdateAndPublish($profileId: ID!, $id: ID!, $input: ChargeScreenMetaAsUserInput!) { r: chargeScreenMetaUpdateAndPublishAsUser(profileId: $profileId, chargeScreenId: $id, input: $input) { id } }",
+                              get: "chargeScreen($profileId: ID!, $id: ID!) { r: chargeScreenAsUser(profileId: $profileId, chargeScreenId: $id) { id status statusMessage } }" },
+            DYNAMIC_24H_WALLPAPER:           { kind: "multi", n: 4, cat: "DYNAMIC_24H_WALLPAPER", p: "dynamicWallpaper", getOp: "dynamicWallpaperGetAsUser", metaOp: "dynamicWallpaperUpdateMetadataAsUser" },
+            DYNAMIC_DUAL_LOCK_WALLPAPER:     { kind: "multi", n: 2, cat: "DYNAMIC_DUAL_LOCK_WALLPAPER", p: "dualLockWallpaper", getOp: "dualLockWallpaperGetAsUser", metaOp: "dualLockWallpaperUpdateMetadataAsUser" },
+            DYNAMIC_BATTERY_LEVEL_WALLPAPER: { kind: "multi", n: 6, cat: "DYNAMIC_BATTERY_LEVEL_WALLPAPER", p: "batteryLevelWallpaper", getOp: "batteryLevelWallpaperGetAsUser", metaOp: "batteryLevelWallpaperUpdateMetadataAsUser" }
+          };
+
+          async function zCategoryId(catType, name) {
+            if (!zApi.cats[catType] || !zApi.cats[catType].length) {
+              const d = await zGql("categories " + catType, "query contentCategories($contentType: ContentType!) { r: contentCategoriesAsUser(contentType: $contentType) { id name } }", { contentType: catType });
+              zApi.cats[catType] = (d && d.r) || [];
+            }
+            const list = zApi.cats[catType];
+            if (!name) return null;
+            const norm = (s) => String(s || "").toUpperCase().replace(/&/g, " N ").replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+            const key = norm(name);
+            const hit = list.find((c) => norm(c.name) === key)
+              || list.find((c) => norm(c.name).replace(/_N_/g, "_") === key.replace(/_N_/g, "_").replace(/_AND_/g, "_"))
+              || list.find((c) => norm(c.name).startsWith(key) || key.startsWith(norm(c.name)));
+            if (!hit) { const e = new Error(`category "${name}" not found for ${catType} (have: ${list.map((c) => c.name).join(", ")})`); e.noFallback = true; throw e; }
+            return Number(hit.id);
+          }
+
+          function zMetaInput(meta, cfg, categoryId) {
+            const tags = String(meta.tags || "").split(",").map((t) => t.trim()).filter((t) => t.length >= 2).slice(0, 10);
+            const input = {
+              name: String(meta.title || "").slice(0, 30),
+              description: String(meta.description || "").slice(0, 200),
+              categoryId: categoryId,
+              tags: tags,
+              lockType: "VIDEO",          // same as the UI path ("Video ad")
+              priceUsd: null,
+              isMatureContent: false,
+              externalId: null
+            };
+            if (cfg.limitedEdition) input.limitedEdition = null;
+            // v41.3: Dual / Battery / 24H use DynamicWallpaperMetadataUpdateInput (matureContent + paymentLock instead of lockType/priceUsd)
+            if (cfg.kind === "multi") {
+              return { name: input.name, description: input.description, categoryId: input.categoryId, tags: input.tags,
+                externalId: null, matureContent: false, paymentLock: { lockType: "VIDEO", priceUsd: null } };   // exact shape from upload.zedge.net HAR (dual / 24h / battery)
+            }
+            return input;
+          }
+
+          async function zArchive(id) {
+            return zGql("archive (remove)", "mutation premiumContentArchive($contentId: ID!) { r: premiumContentArchiveAsUser(contentId: $contentId) { id } }", { contentId: id }, null, 2);
+          }
+
+          // full upload. returns { id, cfg } after publish was requested. err.apiCreatedId is set if an item was already made.
+          async function zApiUploadAndPublish(profileId, zType, meta, localFiles, coverImage, foldImage) {
+            const cfg = Z_API_TYPES[zType];
+            if (!cfg) throw new Error("no API mapping for type " + zType);
+            const files = (Array.isArray(localFiles) ? localFiles : [localFiles]).filter(Boolean);
+            if (!files.length || files.some((f) => !fs.existsSync(f))) throw new Error("local file(s) missing: " + files.join(", "));
+            if (cfg.kind === "multi" && files.length !== cfg.n) throw new Error(`${zType} needs ${cfg.n} images, got ${files.length}`);
+
+            // checks BEFORE creating anything (nothing created yet)
+            const lim = await zGql("uploadLimits", "query businessUploadLimits { r: premium_business_uploadLimits { uploadAllowed uploadLimit uploadLimitDurationDays } }").catch((e) => { console.log("uploadLimits check skipped: " + e.message); return null; });
+            if (lim && lim.r && lim.r.uploadAllowed === false) { const e = new Error(`Zedge upload limit reached (${lim.r.uploadLimit} per ${lim.r.uploadLimitDurationDays} days)`); e.noFallback = true; throw e; }
+            const categoryId = meta.category ? await zCategoryId(cfg.cat, meta.category) : null;
+            const input = zMetaInput(meta, cfg, categoryId);
+            console.log(`API meta: name="${input.name}" categoryId=${categoryId} tags=[${input.tags.join(", ")}] lock=${input.lockType || (input.paymentLock && input.paymentLock.lockType)}`);
+
+            let id = null, fold = null;
+            try {
+              if (cfg.kind === "single") {
+                const vars = { profileId, file: null };
+                if (cfg.enrich) vars.enrich = false;
+                const d = await zGql("create " + zType, "mutation " + cfg.create, vars, [{ path: "variables.file", local: files[0] }], 2);
+                id = d.r.id;
+                console.log(`API: ${zType} created -> ${id}`);
+                // v41.5: the site ALWAYS sends a cover for live / charging (HAR). No thumbnail or cover upload fails -> frame from the video (ffmpeg)
+                const autoCover = () => {
+                  try {
+                    const ff = findFfmpeg(); if (!ff) return null;
+                    const out = files[0].replace(/\.[^.\\/]+$/, "") + "-autocover.jpg";
+                    for (const ss of ["1", "0"]) {
+                      try { require("child_process").execFileSync(ff, ["-y", "-loglevel", "error", "-ss", ss, "-i", files[0], "-frames:v", "1", "-q:v", "2", out], { stdio: "ignore", timeout: 60000 }); } catch (x) {}
+                      if (fs.existsSync(out) && fs.statSync(out).size > 1000) { console.log(`🖼️ auto cover from video frame (${ss}s)`); return out; }
+                    }
+                  } catch (x) { console.warn("auto cover failed: " + x.message); }
+                  return null;
+                };
+                if (cfg.cover) {
+                  let cv = coverImage && fs.existsSync(coverImage) ? coverImage : autoCover();
+                  const upCover = (f) => zGql("cover image", "mutation " + cfg.cover, { profileId, input: { [cfg.coverKey]: id, file: null } }, [{ path: "variables.input.file", local: f }], 2);
+                  if (!cv) console.warn("⚠️ no cover image (no thumbnail, ffmpeg frame failed) - continuing without cover");
+                  else {
+                    try { await upCover(cv); }
+                    catch (ce) {
+                      console.warn("API cover upload issue: " + ce.message);
+                      const af = cv === coverImage ? autoCover() : null;
+                      if (af) { try { await upCover(af); } catch (ce2) { console.warn("auto cover upload also failed (continuing): " + ce2.message); } }
+                    }
+                  }
+                }
+                // v31: foldable / tablet landscape companion (before publish, like the site). A failure never blocks the wallpaper.
+                if (cfg.fold && foldImage && fs.existsSync(foldImage)) {
+                  try {
+                    const fd = await zGql("foldable image", "mutation " + cfg.fold, { profileId, wallpaperId: id, file: null }, [{ path: "variables.file", local: foldImage }], 2);
+                    fold = fd && fd.r && fd.r.landscapeImageUrl ? "ok" : "no url";
+                    console.log(fold === "ok" ? "📱 API: foldable image set" : "⚠️ API: foldable upload returned no landscapeImageUrl");
+                  } catch (fe) { fold = "failed: " + fe.message; console.warn("⚠️ API foldable image failed (wallpaper continues): " + fe.message); }
+                }
+                await waitForExactTarget("Publish");   // v26.2 exact-time hold, same as UI path
+                await zGql("meta+publish", "mutation " + cfg.meta, { profileId, id, input }, null, 2);
+              } else {
+                const P = cfg.p;
+                const d = await zGql("create " + zType, `mutation ${P}Create($profileId: ID!) { r: ${P}CreateAsUser(profileId: $profileId) { id } }`, { profileId }, null, 2);
+                id = d.r.id;
+                console.log(`API: ${zType} created -> ${id}`);
+                for (let k = 0; k < files.length; k++) {
+                  await zGql(`image ${k + 1}/${files.length}`,
+                    `mutation ${P}SetImageVariant($profileId: ID!, $contentId: ID!, $imageVariantIndex: Int!, $file: Upload!) { r: ${P}SetImageVariantAsUser(profileId: $profileId, contentId: $contentId, imageVariantIndex: $imageVariantIndex, file: $file) { id } }`,
+                    { profileId, contentId: id, imageVariantIndex: k, file: null }, [{ path: "variables.file", local: files[k] }], 2);
+                }
+                await zGql("meta", `mutation ${P}MetaUpdate($profileId: ID!, $contentId: ID!, $input: DynamicWallpaperMetadataUpdateInput!) { r: ${cfg.metaOp}(profileId: $profileId, contentId: $contentId, input: $input) { id } }`, { profileId, contentId: id, input }, null, 2);
+                await waitForExactTarget("Publish");
+                await zGql("publish", "mutation premiumContentPublish($contentId: ID!) { r: premiumContentPublishAsUser(contentId: $contentId) { id } }", { contentId: id }, null, 2);
+              }
+              console.log(`API: publish requested for ${id}`);
+              return { id, cfg, fold };
+            } catch (e) {
+              if (id) e.apiCreatedId = id;
+              throw e;
+            }
+          }
+
+          async function zApiGetStatus(profileId, zType, id) {
+            const cfg = Z_API_TYPES[zType];
+            const q = cfg.kind === "single" ? "query " + cfg.get
+              : `query g($profileId: ID!, $id: ID!) { r: ${cfg.getOp}(profileId: $profileId, contentId: $id) { id status itemStatus } }`;
+            const d = await zGql("status", q, { profileId, id }, null, 2);
+            const r = (d && d.r) || {};
+            return { status: String(r.status || r.itemStatus || "UNKNOWN").toUpperCase(), message: r.statusMessage || null };
+          }
+
+          // same contract as the old status check: { removed, statusName }
+          // poll: every 3s for 2 min, then every 10s, then every 20s (max ~17 min, like the old 50 x 20s UI loop)
+          async function zApiVerifyStatus(profileId, zType, id) {
+            const WAITING = ["DRAFT", "IN_PROCESS", "PROCESSING", "PUBLISHING", "UPLOADING", "UNKNOWN"];
+            const REMOVE = ["PENDING", "IN_REVIEW", "REJECTED", "FAILED"];
+            const t0 = Date.now(); let a = 0, last = "";
+            while (Date.now() - t0 < 17 * 60 * 1000) {
+              a++;
+              const el = Date.now() - t0;
+              await zSleep(el < 120000 ? 3000 : el < 600000 ? 10000 : 20000);
+              let st;
+              try { st = await zApiGetStatus(profileId, zType, id); }
+              catch (e) { console.log(`API status check #${a} failed: ${e.message}`); continue; }
+              if (st.status !== last || a % 10 === 0) console.log(`API status #${a} (${Math.round((Date.now() - t0) / 1000)}s): ${st.status}${st.message ? " - " + st.message : ""}`);
+              last = st.status;
+              if (st.status === "PUBLISHED") return { removed: false, statusName: "PUBLISHED" };
+              if (REMOVE.includes(st.status)) {
+                const statusName = st.status === "IN_REVIEW" ? "IN REVIEW" : st.status;
+                console.log(`Status is ${statusName}${st.message ? " (" + st.message + ")" : ""}. Removing via API (archive)...`);
+                await zArchive(id).catch((e) => console.warn("API archive failed: " + e.message));
+                return { removed: true, statusName, message: st.message || null };
+              }
+              if (!WAITING.includes(st.status)) console.log("API: unexpected status " + st.status + " - keep waiting");
+            }
+            console.log("Warning: API status check timed out. Proceeding anyway.");
+            return { removed: false, statusName: "UNKNOWN" };
+          }
+          // ═══════════════════════════════ end v30 API ONLY ═══════════════════════════════
+
+
           // --- PROFILE ROTATION STATE MANAGER ---
 
           // Returns the next profile index whose upload count is still below perProfileLimit.
@@ -2965,10 +3411,10 @@ jobs:
 
           async function getProfileState(totalProfilesCount) {
             console.log("Checking profile rotation state...");
-            
+
             // Get current date in Dhaka timezone (e.g. "5/1/2026")
             const today = new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka" }).split(",")[0];
-            
+
             let state;
             try {
               state = await firebaseGet("uploadState");
@@ -3043,7 +3489,7 @@ jobs:
 
           async function updateProfileStateAfterUpload(state, usedProfileIndex) {
             console.log(`Updating state: Profile ${usedProfileIndex} was used. Total today is now ${state.totalUploadsToday + 1}`);
-            
+
             const profileUploadCounts = { ...(state.profileUploadCounts || {}) };
             profileUploadCounts[usedProfileIndex] = (profileUploadCounts[usedProfileIndex] || 0) + 1;
 
@@ -3074,6 +3520,68 @@ jobs:
           function slotFileUrl(item, slot) {
             const v = item && item.files ? item.files[slot] : null;
             return typeof v === "string" ? v : ((v && v.fileUrl) || "");
+          }
+
+          // ── v31 FOLDABLE (landscape) companion for single wallpapers ───────────────────────────────
+          // Source (same as the AI Image Studio): queue item foldUrl, or files["wallpaper-landscape"]
+          // (studio record), or landscapeUrl. Zedge rule: JPEG, >= 2800x2400, 7:6, max 25 MP / 8 MB.
+          const FOLD_RULE = { w: 2800, h: 2400, maxBytes: 8 * 1024 * 1024, maxMP: 25 };
+          function foldSourceUrl(item) {
+            if (!item) return "";
+            return String(item.foldUrl || slotFileUrl(item, "wallpaper-landscape") || item.landscapeUrl || "").trim();
+          }
+          function jpegSize(buf) {
+            if (!buf || buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) return null;
+            let i = 2;
+            while (i + 9 < buf.length) {
+              if (buf[i] !== 0xff) { i++; continue; }
+              const m = buf[i + 1];
+              if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) return { h: buf.readUInt16BE(i + 5), w: buf.readUInt16BE(i + 7) };
+              i += 2 + buf.readUInt16BE(i + 2);
+            }
+            return null;
+          }
+          function foldProblems(file) {
+            const buf = fs.readFileSync(file); const d = jpegSize(buf); const p = [];
+            if (!d) { p.push("not a JPEG"); return { p, d }; }
+            if (buf.length > FOLD_RULE.maxBytes) p.push(`${(buf.length / 1048576).toFixed(1)} MB > 8 MB`);
+            if (d.w < FOLD_RULE.w || d.h < FOLD_RULE.h) p.push(`${d.w}x${d.h} < 2800x2400`);
+            if (d.w * d.h / 1e6 > FOLD_RULE.maxMP) p.push(`${(d.w * d.h / 1e6).toFixed(1)} MP > 25 MP`);
+            if (Math.abs(d.w / d.h - 7 / 6) / (7 / 6) > 0.02) p.push(`ratio ${(d.w / d.h).toFixed(3)} != 7:6`);
+            return { p, d };
+          }
+          // Same fit as the studio: centred trim to 7:6, scale to exactly 2800x2400, JPEG under 8 MB.
+          function foldFit(src, dst) {
+            const { execFileSync } = require("child_process");
+            const ff = findFfmpeg(); if (!ff) throw new Error("ffmpeg not found");
+            for (const q of [2, 3, 4, 6, 8]) {
+              execFileSync(ff, ["-y", "-loglevel", "error", "-i", src, "-vf",
+                "crop='if(gt(iw/ih,7/6),ih*7/6,iw)':'if(gt(iw/ih,7/6),ih,iw*6/7)',scale=2800:2400:flags=bicubic",
+                "-q:v", String(q), "-frames:v", "1", dst], { stdio: "ignore", timeout: 120000 });
+              if (fs.existsSync(dst) && fs.statSync(dst).size <= FOLD_RULE.maxBytes - 65536) return dst;
+            }
+            return dst;
+          }
+          async function prepareFold(item, localDir, id) {
+            const url = foldSourceUrl(item);
+            if (!url) return null;
+            const raw = path.join(localDir, `${id}-landscape-src`);
+            try {
+              const res = await fetch(url);
+              if (!res.ok) throw new Error("HTTP " + res.status);
+              fs.writeFileSync(raw, Buffer.from(await res.arrayBuffer()));
+            } catch (e) { console.warn(`⚠️ Foldable image download failed (${e.message}) - wallpaper will upload without it`); return { file: null, note: "download failed" }; }
+            let chk = foldProblems(raw);
+            if (!chk.p.length) { const f = path.join(localDir, `${id}-landscape.jpg`); fs.renameSync(raw, f); console.log(`📱 Foldable image ready ${chk.d.w}x${chk.d.h}`); return { file: f, note: null }; }
+            const d = chk.d;
+            if (d && (d.w / d.h < 0.99 || d.w / d.h > 1.52)) { console.warn(`⚠️ Foldable image is not landscape (${d.w}x${d.h}) - skipped`); return { file: null, note: `not landscape ${d.w}x${d.h}` }; }
+            try {
+              const f = foldFit(raw, path.join(localDir, `${id}-landscape.jpg`));
+              chk = foldProblems(f);
+              if (chk.p.length) throw new Error(chk.p.join(", "));
+              console.log(`📱 Foldable image auto-fitted to ${chk.d.w}x${chk.d.h} (was: ${foldProblems(raw).p.join(", ")})`);
+              return { file: f, note: null };
+            } catch (e) { console.warn(`⚠️ Foldable image does not match Zedge rules and auto-fit failed (${e.message}) - skipped`); return { file: null, note: e.message }; }
           }
 
           // ── v23 metadata guard helpers ───────────────────────────────────────────
@@ -3333,6 +3841,7 @@ jobs:
             let localFiles = [];
             let fileUrls = [];
             let localThumb = null;
+            let localFold = null, foldNote = null;
 
             if (SET_SLOTS[contentType]) {
               // Multi-image set (24H / Dual / Battery) - download every slot image in order
@@ -3383,6 +3892,10 @@ jobs:
               }
               localFiles = [localFile];
               if (item.fileUrl) fileUrls = [item.fileUrl];
+              if (!isMp3 && contentType === "WALLPAPER") {
+                const fp = await prepareFold(item, localDir, id);
+                if (fp) { localFold = fp.file; foldNote = fp.note; fileUrls.push(foldSourceUrl(item)); }   // R2 cleanup after upload
+              }
             }
 
             // Item already claimed above (anti double-upload guard) - no re-claim needed.
@@ -3392,6 +3905,9 @@ jobs:
               localFile,
               localFiles,
               localThumb,
+              localFold,
+              foldNote,
+              hasFoldSource: !!foldSourceUrl(item),
               contentType,
               isMp3,
               dayTypeSwitchedTo,
@@ -3487,59 +4003,8 @@ jobs:
             return "Asia/Dhaka";
           }
 
-          async function safeClick(locator, label, timeout = 30000) {
-            console.log(`Clicking ${label}`);
-            await locator.waitFor({ state: "visible", timeout });
-            await locator.scrollIntoViewIfNeeded();
-            await locator.click();
-          }
 
-          async function safeClickWithPopupRecovery(page, locator, label, timeout = 30000, retries = 4) {
-            let lastErr = null;
-            for (let attempt = 1; attempt <= retries; attempt++) {
-              try {
-                await dismissConsentPopup(page);
-                await page.waitForTimeout(300);
-                await safeClick(locator, `${label} (attempt ${attempt}/${retries})`, timeout);
-                return;
-              } catch (err) {
-                lastErr = err;
-                console.log(`⚠️ Click failed for ${label} on attempt ${attempt}: ${err.message}`);
-                await dismissConsentPopup(page).catch(() => {});
-                await page.evaluate(() => {
-                  document.body.style.overflow = "";
-                  document.documentElement.style.overflow = "";
-                  const nodes = [...document.querySelectorAll("*")];
-                  let touched = 0;
-                  for (const el of nodes) {
-                    try {
-                      const s = window.getComputedStyle(el);
-                      if ((s.position === "fixed" || s.position === "sticky") &&
-                          parseInt(s.zIndex || "0", 10) >= 999 &&
-                          el.offsetWidth >= window.innerWidth * 0.9 &&
-                          el.offsetHeight >= window.innerHeight * 0.6) {
-                        el.style.pointerEvents = "none";
-                        el.style.display = "none";
-                        touched++;
-                      }
-                    } catch (_) {}
-                  }
-                  return touched;
-                }).catch(() => {});
-                await page.waitForTimeout(700);
-              }
-            }
-            throw new Error(`Failed to click ${label} after ${retries} attempts. Last error: ${lastErr?.message || "unknown"}`);
-          }
 
-          async function safeType(locator, value, label) {
-            console.log(`Typing ${label}`);
-            await locator.waitFor({ state: "visible" });
-            await locator.scrollIntoViewIfNeeded();
-            await locator.click();
-            await locator.fill("");
-            await locator.pressSequentially(value, { delay: 90 });
-          }
 
           async function scrollFullPage(page) {
             await page.evaluate(async () => {
@@ -3559,257 +4024,7 @@ jobs:
             });
           }
 
-          async function scrollToElement(locator) {
-            await locator.waitFor({ state: "attached" });
-            await locator.evaluate(el => {
-              el.scrollIntoView({ block: "center", inline: "center" });
-            });
-          }
 
-          async function dismissConsentPopup(page) {
-            console.log("Checking for consent/cookie popups in all frames...");
-            let clickedAny = false;
-
-            const acceptPriority = [
-              "accept all cookies",
-              "accept all",
-              "agree to all",
-              "accept cookies",
-              "i agree",
-              "agree",
-              "allow all",
-              "allow",
-              "continue",
-              "accept & continue",
-              "got it",
-              "ok",
-              "okay",
-              "proceed",
-              "understand"
-            ];
-
-            const negativeWords = ["reject", "disagree", "decline", "optional", "deny"];
-
-            const socialOrLoginKeywords = [
-              "facebook", "google", "apple", "email", "password", 
-              "login", "log in", "signin", "sign in", "signup", "sign up", 
-              "register", "create account", "continue with", "facebook lite", "sign up"
-            ];
-
-            for (const frame of page.frames()) {
-              try {
-                const clicked = await frame.evaluate(({ acceptPriority, negativeWords, socialOrLoginKeywords }) => {
-                  const buttons = Array.from(document.querySelectorAll("button, [role='button'], a"));
-                  
-                  const isLoginPage = window.location.href.includes("account.zedge.net") || 
-                                       window.location.href.includes("login") || 
-                                       !!document.querySelector('input[type="email"], input[type="password"]');
-
-                  const isConsentContainer = (el) => {
-                    let cur = el;
-                    while (cur) {
-                      const id = (cur.id || "").toLowerCase();
-                      const className = (typeof cur.className === "string" ? cur.className : "").toLowerCase();
-                      const role = (cur.getAttribute?.("role") || "").toLowerCase();
-                      if (id.includes("didomi") || className.includes("didomi") ||
-                          id.includes("consent") || className.includes("consent") ||
-                          id.includes("cookie") || className.includes("cookie") ||
-                          id.includes("privacy") || className.includes("privacy") ||
-                          id.includes("popup") || className.includes("popup") ||
-                          role === "dialog" || role === "alertdialog") {
-                        return true;
-                      }
-                      cur = cur.parentElement;
-                    }
-                    return false;
-                  };
-
-                  const candidates = [];
-                  for (const btn of buttons) {
-                    const rect = btn.getBoundingClientRect();
-                    const isVisible = rect.width > 0 && rect.height > 0 && 
-                                      window.getComputedStyle(btn).display !== "none" && 
-                                      window.getComputedStyle(btn).visibility !== "hidden";
-                    if (!isVisible) continue;
-
-                    const text = (btn.innerText || "").trim().toLowerCase();
-                    const ariaLabel = (btn.getAttribute("aria-label") || "").trim().toLowerCase();
-                    const title = (btn.getAttribute("title") || "").trim().toLowerCase();
-                    const id = (btn.id || "").trim().toLowerCase();
-                    const className = (typeof btn.className === "string" ? btn.className : "").trim().toLowerCase();
-                    const combined = `${text} ${ariaLabel} ${title} ${id} ${className}`.trim();
-
-                    if (!combined) continue;
-
-                    if (negativeWords.some(w => combined.includes(w))) continue;
-                    if (socialOrLoginKeywords.some(w => combined.includes(w))) continue;
-                    if (isLoginPage && !isConsentContainer(btn)) continue;
-
-                    candidates.push({ btn, text, ariaLabel, title, combined });
-                  }
-
-                  for (const phrase of acceptPriority) {
-                    const match = candidates.find(c => {
-                      if (phrase === "ok" || phrase === "okay" || phrase === "agree" || phrase === "allow" || phrase === "continue") {
-                        const words = c.text.split(/\s+/);
-                        return words.includes(phrase) || c.text === phrase;
-                      }
-                      return c.text === phrase || c.ariaLabel === phrase || c.title === phrase || c.combined.includes(phrase);
-                    });
-
-                    if (match) {
-                      match.btn.click();
-                      return { clicked: true, text: match.text || match.ariaLabel || "button" };
-                    }
-                  }
-
-                  const generic = candidates.find(c =>
-                    c.combined.includes("accept") || c.combined.includes("agree")
-                  );
-                  if (generic) {
-                    generic.btn.click();
-                    return { clicked: true, text: generic.text || "generic button" };
-                  }
-
-                  return { clicked: false };
-                }, { acceptPriority, negativeWords, socialOrLoginKeywords });
-
-                if (clicked && clicked.clicked) {
-                  console.log(`✅ Clicked consent accept element: "${clicked.text}" in frame: ${frame.url()}`);
-                  clickedAny = true;
-                  await page.waitForTimeout(500);
-                }
-              } catch (_) {}
-            }
-
-            // Fallback close/remove only if no accept click happened
-            if (!clickedAny) {
-              try {
-                const nuked = await page.evaluate(() => {
-                  let killed = 0;
-
-                  function nukeElements(root) {
-                    let k = 0;
-                    if (!root) return k;
-
-                    const selectors = [
-                      '#didomi-host',
-                      '.didomi-popup',
-                      '[id*="didomi"]',
-                      '[class*="didomi"]',
-                      'dialog',
-                      '[role="dialog"]',
-                      '[class*="consent"]',
-                      '[class*="cookie"]',
-                      '[class*="privacy"]',
-                      '[class*="modal"]',
-                      '[class*="popup"]',
-                      '[class*="dialog"]',
-                      '[class*="overlay"]',
-                      '[class*="backdrop"]',
-                      '[class*="banner"]',
-                      '[class*="notification"]',
-                      '[class*="alert"]',
-                      '[class*="announcement"]',
-                      '[id*="consent"]',
-                      '[id*="cookie"]',
-                      '[id*="privacy"]',
-                      '[id*="modal"]',
-                      '[id*="popup"]',
-                      '[id*="dialog"]',
-                      '[id*="overlay"]',
-                      '[id*="backdrop"]',
-                      '[id*="banner"]'
-                    ];
-
-                    function isProtected(el) {
-                      if (!el) return false;
-                      if (el.querySelector("[data-hook]") || el.closest("[data-hook]")) return true;
-                      
-                      let current = el;
-                      while (current) {
-                        if (current.tagName === 'DIALOG' || 
-                            current.getAttribute('role') === 'dialog' || 
-                            current.classList.contains('sc-gKXOVf') ||
-                            current.classList.contains('dwmyJL')) {
-                          
-                          if (current.id === 'didomi-host') return false;
-                          
-                          const text = (current.innerText || current.textContent || "").toLowerCase();
-                          const uploadKeywords = [
-                            "upload",
-                            "wallpaper",
-                            "ringtone",
-                            "edit meta",
-                            "publish",
-                            "content policy",
-                            "ownership",
-                            "title",
-                            "tags",
-                            "category",
-                            "description",
-                            "success",
-                            "pending",
-                            "published"
-                          ];
-                          if (uploadKeywords.some(kw => text.includes(kw))) {
-                            return true;
-                          }
-                        }
-                        current = current.parentElement;
-                      }
-                      return false;
-                    }
-
-                    selectors.forEach(sel => {
-                      const els = root.querySelectorAll(sel);
-                      els.forEach(el => {
-                        if (!isProtected(el)) {
-                          el.remove();
-                          k++;
-                        }
-                      });
-                    });
-
-                    // Traverse shadow roots recursively
-                    const allEls = root.querySelectorAll('*');
-                    allEls.forEach(el => {
-                      if (el.shadowRoot) {
-                        k += nukeElements(el.shadowRoot);
-                      }
-                    });
-
-                    return k;
-                  }
-
-                  killed += nukeElements(document);
-
-                  const iframes = document.querySelectorAll(
-                    'iframe[src*="consent"], iframe[src*="cookie"], iframe[src*="privacy"], ' +
-                    'iframe[id*="consent"], iframe[id*="cookie"]'
-                  );
-                  iframes.forEach(iframe => {
-                    iframe.remove();
-                    killed++;
-                  });
-
-                  if (killed > 0 || document.getElementById('didomi-host')) {
-                    document.body.style.setProperty("overflow", "auto", "important");
-                    document.documentElement.style.setProperty("overflow", "auto", "important");
-                    document.body.style.setProperty("pointer-events", "auto", "important");
-                    document.documentElement.style.setProperty("pointer-events", "auto", "important");
-                  }
-                  return killed;
-                });
-                if (nuked > 0) {
-                  console.log(`✅ JS removed ${nuked} blocking elements.`);
-                  clickedAny = true;
-                }
-              } catch (_) {}
-            }
-
-            return clickedAny;
-          }
 
           // Keep dismissing Zedge privacy/cookie/data-collection popups whenever they appear
           async function installPrivacyPopupWatcher(page) {
@@ -3819,429 +4034,9 @@ jobs:
             console.log("Privacy popup auto-watcher is disabled - using explicit Didomi handler instead");
           }
 
-          async function forceCheckByDataHook(page, dataHookValue, label) {
-            console.log(`Force checking: ${label}`);
 
-            await page.waitForSelector(
-              `input[data-hook="${dataHookValue}-input"]`,
-              { state: "attached", timeout: 30000 }
-            );
 
-            await page.evaluate((hook) => {
-              const input = document.querySelector(`input[data-hook="${hook}-input"]`);
-              if (!input) throw new Error(`Checkbox input not found: ${hook}`);
-              input.click();
-            }, dataHookValue);
 
-            const isChecked = await page.evaluate((hook) => {
-              const input = document.querySelector(`input[data-hook="${hook}-input"]`);
-              return input ? input.checked : false;
-            }, dataHookValue);
-
-            if (!isChecked) {
-              console.log(`${label} not checked after click — forcing via JS property`);
-              await page.evaluate((hook) => {
-                const input = document.querySelector(`input[data-hook="${hook}-input"]`);
-                if (!input) throw new Error(`Checkbox input not found: ${hook}`);
-                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                  window.HTMLInputElement.prototype, "checked"
-                ).set;
-                nativeInputValueSetter.call(input, true);
-                input.dispatchEvent(new Event("click", { bubbles: true }));
-                input.dispatchEvent(new Event("change", { bubbles: true }));
-                input.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-                input.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-              }, dataHookValue);
-            }
-
-            const finalChecked = await page.evaluate((hook) => {
-              const input = document.querySelector(`input[data-hook="${hook}-input"]`);
-              return input ? input.checked : false;
-            }, dataHookValue);
-
-            if (!finalChecked) throw new Error(`Failed to check checkbox: ${label}`);
-            console.log(`${label} confirmed checked`);
-          }
-
-          async function uploadWallpaperInDialog(page, localFile) {
-            console.log("Waiting for Upload dialog (with file input inside)");
-
-            // Wait specifically for an upload dialog that contains the file input — not the type-selection menu
-            let dialog;
-            try {
-              await page.waitForSelector(
-                'input[data-hook="form-field-files-input"]',
-                { state: "attached", timeout: 30000 }
-              );
-              console.log("Upload dialog detected via file input");
-              dialog = page.locator('[role="dialog"]').filter({ has: page.locator('input[data-hook="form-field-files-input"]') }).first();
-              if (!(await dialog.count())) {
-                // Fallback: maybe it's a full page instead of dialog
-                console.log("No dialog wrapper found — treating whole page as upload form");
-                dialog = page.locator("body");
-              }
-            } catch (e) {
-              await page.screenshot({ path: "zedge-dialog-error.png", fullPage: true });
-              throw new Error(`Upload dialog did not appear after 30s. Check zedge-dialog-error.png. Original: ${e.message}`);
-            }
-            await page.waitForTimeout(1000);
-
-            await forceCheckByDataHook(page, "form-field-accept-input", "first ownership checkbox");
-            await page.waitForTimeout(500);
-
-            await forceCheckByDataHook(page, "form-field-acceptContentPolicy-input", "second content policy checkbox");
-            await page.waitForTimeout(500);
-
-            console.log("Waiting for file input");
-            const fileInput = dialog
-              .locator('input[data-hook="form-field-files-input"]')
-              .first();
-
-            await fileInput.waitFor({ state: "attached" });
-            const filesToUpload = Array.isArray(localFile) ? localFile : [localFile];
-            console.log(`Uploading ${filesToUpload.length} file(s)`);
-            await fileInput.setInputFiles(filesToUpload);
-
-            await page.waitForFunction((expectedCount) => {
-              const input = document.querySelector('input[data-hook="form-field-files-input"]');
-              return input && input.files && input.files.length >= expectedCount;
-            }, filesToUpload.length);
-
-            console.log("Waiting for Upload button to become enabled");
-            const uploadButton = dialog
-              .locator('button[type="submit"]:has-text("Upload")')
-              .first();
-
-            await uploadButton.waitFor({ state: "visible" });
-            await scrollToElement(uploadButton);
-
-            await page.waitForFunction(() => {
-              const buttons = [...document.querySelectorAll('button[type="submit"]')];
-              const upload = buttons.find(btn => btn.textContent.trim() === "Upload");
-              return upload && upload.disabled === false;
-            });
-
-            await uploadButton.click();
-
-            console.log("Waiting for Edit meta button");
-            const editMetaButton = page
-              .locator('[role="dialog"] button:has-text("Edit meta")')
-              .first();
-
-            // v27.11.2: bounded waits (10 min) - a stuck Zedge upload/processing no longer hangs the run forever
-            await editMetaButton.waitFor({ state: "visible", timeout: 10 * 60 * 1000 });
-
-            await page.waitForFunction(() => {
-              const buttons = [...document.querySelectorAll("button")];
-              const editMeta = buttons.find(btn => btn.textContent.trim() === "Edit meta");
-              return editMeta && editMeta.disabled === false;
-            }, null, { timeout: 10 * 60 * 1000 });
-
-            await scrollToElement(editMetaButton);
-            await editMetaButton.click();
-            console.log("Clicked Edit meta");
-          }
-
-          async function fillMetaDialog(page, meta) {
-            console.log("Waiting for meta dialog to open");
-
-            await page.waitForSelector(
-              'input[data-hook="form-field-name-input"]',
-              { state: "visible", timeout: 30000 }
-            );
-
-            await page.waitForTimeout(800);
-
-            // \u2500\u2500 COVER IMAGE (Live Wallpaper / Charging Animation) \u2500\u2500
-            if (meta.coverImage) {
-              try {
-                console.log("Uploading cover image (auto thumbnail)");
-                const addCover = page.locator('a:has-text("Add cover image")').first();
-                await addCover.waitFor({ state: "visible", timeout: 15000 });
-                await scrollToElement(addCover);
-                await addCover.click();
-                console.log("Clicked Add cover image");
-
-                const coverDialog = page.locator('[role="dialog"]').filter({ hasText: "Upload cover image" }).first();
-                await coverDialog.waitFor({ state: "visible", timeout: 15000 });
-
-                const coverInput = coverDialog.locator('input[data-hook="form-field-files-input"]').first();
-                await coverInput.waitFor({ state: "attached" });
-                await coverInput.setInputFiles(meta.coverImage);
-                console.log("Cover image file set");
-                await page.waitForTimeout(800);
-
-                for (const hook of ["form-field-accept-input", "form-field-acceptContentPolicy-input"]) {
-                  const cb = coverDialog.locator(`[data-hook="${hook}"]`).first();
-                  if (await cb.count()) {
-                    await cb.click({ force: true });
-                    await page.waitForTimeout(300);
-                  }
-                }
-
-                const coverSubmit = coverDialog.locator('button[type="submit"]:has-text("Upload")').first();
-                await page.waitForFunction(() => {
-                  const dialogs = [...document.querySelectorAll('[role="dialog"]')];
-                  const dlg = dialogs.find(d => d.textContent.includes("Upload cover image"));
-                  if (!dlg) return false;
-                  const btn = [...dlg.querySelectorAll('button[type="submit"]')].find(b => b.textContent.trim() === "Upload");
-                  return btn && btn.disabled === false;
-                }, { timeout: 20000 });
-                await coverSubmit.click();
-                await coverDialog.waitFor({ state: "detached", timeout: 30000 }).catch(() => {});
-                console.log("Cover image uploaded");
-                await page.waitForTimeout(1000);
-              } catch (e) {
-                console.warn(`Cover image upload issue (continuing): ${e.message}`);
-              }
-            }
-
-            // ── TITLE ──────────────────────────────────────────────
-            console.log("Filling title");
-            const titleInput = page.locator('input[data-hook="form-field-name-input"]').first();
-            await titleInput.waitFor({ state: "visible" });
-            await scrollToElement(titleInput);
-            await titleInput.click();
-            
-            const title = String(meta.title || "").slice(0, 30);
-            await titleInput.fill(title);
-            await titleInput.press('Tab'); 
-            await page.waitForTimeout(300);
-            console.log(`Title filled: "${title}"`);
-
-            // ── TAGS ───────────────────────────────────────────────
-            if (meta.tags) {
-              const tagList = String(meta.tags)
-                .split(",")
-                .map(t => t.trim())
-                .filter(Boolean)
-                .filter(t => t.length >= 2)
-                .slice(0, 10);
-
-              console.log(`Filling ${tagList.length} valid tags`);
-              
-              const tagsInput = page.locator('.react-select__input').nth(0);
-
-              for (const tag of tagList) {
-                await tagsInput.waitFor({ state: "attached" });
-                await scrollToElement(tagsInput);
-                await tagsInput.click({ force: true });
-                await tagsInput.fill(tag);
-                await page.waitForTimeout(300);
-                await tagsInput.press("Enter");
-                await page.waitForTimeout(200);
-                console.log(`Tag added: "${tag}"`);
-              }
-              await tagsInput.press('Tab');
-            }
-
-            // ── CATEGORY ───────────────────────────────────────────
-            if (meta.category) {
-              console.log(`Filling category: "${meta.category}"`);
-              
-              const categoryInput = page.locator('.react-select__input').nth(1);
-              
-              await categoryInput.waitFor({ state: "attached" });
-              await scrollToElement(categoryInput);
-              await categoryInput.click({ force: true });
-              
-              await categoryInput.fill(String(meta.category));
-              await page.waitForTimeout(500);
-
-              await categoryInput.press("Enter");
-              await categoryInput.press('Tab');
-              console.log(`Category selected: "${meta.category}"`);
-            }
-
-            // ── DESCRIPTION ────────────────────────────────────────
-            if (meta.description) {
-              console.log("Filling description");
-              const descInput = page.locator('textarea[data-hook="form-field-description-input"]').first();
-              await descInput.waitFor({ state: "visible" });
-              await scrollToElement(descInput);
-              await descInput.click();
-              
-              const desc = String(meta.description || "").slice(0, 200);
-              await descInput.fill(desc);
-              
-              await descInput.press('Tab');
-              await page.waitForTimeout(300);
-              console.log(`Description filled`);
-            }
-
-            // ── VIDEO AD RADIO BUTTON ──────────────────────────────
-            console.log("Scrolling to lock type section");
-
-            await page.waitForSelector(
-              'input[name="lockType"]',
-              { state: "attached", timeout: 15000 }
-            );
-
-            await page.evaluate(() => {
-              const wrappers = [...document.querySelectorAll('input[name="lockType"]')];
-              const videoAdRadio = wrappers.find(input => {
-                const container = input.closest('.sc-fHsOPI') || input.parentElement;
-                return container && container.textContent.includes("Video ad");
-              });
-
-              if (!videoAdRadio) throw new Error("Video ad radio button not found");
-
-              videoAdRadio.scrollIntoView({ block: "center" });
-              videoAdRadio.click();
-
-              videoAdRadio.dispatchEvent(new Event("change", { bubbles: true }));
-            });
-
-            await page.waitForTimeout(500);
-
-            const videoAdSelected = await page.evaluate(() => {
-              const wrappers = [...document.querySelectorAll('input[name="lockType"]')];
-              const videoAdRadio = wrappers.find(input => {
-                const container = input.closest('.sc-fHsOPI') || input.parentElement;
-                return container && container.textContent.includes("Video ad");
-              });
-              return videoAdRadio ? videoAdRadio.checked : false;
-            });
-
-            if (!videoAdSelected) {
-              console.log("Video ad not selected via JS click — trying Playwright locator");
-
-              const videoAdWrapper = page
-                .locator('.sc-fHsOPI')
-                .filter({ hasText: "Video ad" })
-                .first();
-
-              await scrollToElement(videoAdWrapper);
-              const radioInWrapper = videoAdWrapper.locator('input[type="radio"]').first();
-              await radioInWrapper.click({ force: true });
-              await page.waitForTimeout(400);
-            }
-
-            console.log("Video ad radio selected");
-
-            await waitForExactTarget("Publish");   // v26.2 exact-time hold
-            // ── PUBLISH BUTTON ────────────────────────────────────
-            console.log("Looking for Publish button");
-
-            const publishButton = page
-              .locator('button')
-              .filter({ hasText: /^Publish$/ })
-              .first();
-
-            // v27.5 robust publish: scroll + 3 click strategies + confirm the button is gone
-            let publishClicked = false;
-            try {
-              await publishButton.waitFor({ state: "visible", timeout: 15000 });
-              await publishButton.scrollIntoViewIfNeeded().catch(() => {});
-              await scrollToElement(publishButton).catch(() => {});
-              await page.waitForTimeout(300);
-              await publishButton.click({ timeout: 8000 });
-              publishClicked = true;
-            } catch (e) {
-              console.log("Publish click (primary) failed: " + (e && e.message ? e.message.split("\n")[0] : e));
-            }
-            if (!publishClicked) {
-              await page.mouse.wheel(0, 4000).catch(() => {});
-              await page.waitForTimeout(600);
-              const byRole = page.getByRole("button", { name: /^Publish$/ }).first();
-              try {
-                await byRole.waitFor({ state: "visible", timeout: 8000 });
-                await byRole.scrollIntoViewIfNeeded().catch(() => {});
-                await byRole.click({ timeout: 8000 });
-                publishClicked = true;
-                console.log("Publish clicked via role locator");
-              } catch (e2) {
-                console.log("Publish click (role) failed: " + (e2 && e2.message ? e2.message.split("\n")[0] : e2));
-              }
-            }
-            if (!publishClicked) {
-              publishClicked = await page.evaluate(() => {
-                const btn = Array.from(document.querySelectorAll("button")).find((b) => (b.textContent || "").trim() === "Publish");
-                if (!btn) return false;
-                btn.scrollIntoView({ block: "center" });
-                btn.click();
-                return true;
-              }).catch(() => false);
-              console.log(publishClicked ? "Publish clicked via DOM" : "Publish button not found in DOM");
-            }
-            if (!publishClicked) throw new Error("Publish button could not be clicked - item left as draft");
-            try {
-              await publishButton.waitFor({ state: "hidden", timeout: 15000 });
-            } catch (_) {
-              console.log("Publish button still visible after click - retrying once (force)");
-              await publishButton.click({ force: true, timeout: 5000 }).catch(() => {});
-              await page.waitForTimeout(1500);
-            }
-
-            console.log("Clicked Publish");
-          }
-
-          async function verifyPublishStatus(page) {
-            console.log("Waiting 5 seconds before checking status...");
-            await page.waitForTimeout(5000);
-
-            let attempts = 0;
-            const maxAttempts = 50;
-
-            while (attempts < maxAttempts) {
-              attempts++;
-              console.log(`Reloading page to fetch latest server status (Attempt ${attempts}/${maxAttempts})...`);
-              
-              await page.reload({ waitUntil: "domcontentloaded" });
-              
-              try {
-                await page.waitForSelector('span[type="INFO"], span[type="SUCCESS"], span.sc-jtJlRs', { state: 'attached', timeout: 15000 });
-                await page.waitForTimeout(1000);
-              } catch (e) {
-                console.log("Warning: Badges didn't load in time after refresh. Network might be slow.");
-              }
-
-              const pending = page.locator('span').filter({ hasText: /^PENDING$/ }).first();
-              const published = page.locator('span').filter({ hasText: /^PUBLISHED$/ }).first();
-              const inReview = page.locator('span').filter({ hasText: /^IN REVIEW$/i }).first();
-              const rejected = page.locator('span').filter({ hasText: /^REJECTED$/i }).first();
-
-              if (await published.isVisible()) {
-                console.log("Status confirmed: PUBLISHED! Excellent. Stopping checks.");
-                return { removed: false, statusName: "PUBLISHED" };
-              }
-
-              if (await pending.isVisible() || await inReview.isVisible() || await rejected.isVisible()) {
-                let statusName = "PENDING";
-                if (await inReview.isVisible()) statusName = "IN REVIEW";
-                else if (await rejected.isVisible()) statusName = "REJECTED";
-
-                console.log(`Status is ${statusName}. Initiating removal process...`);
-
-                const ellipsisBtn = page.locator('button:has(svg[data-icon="ellipsis-h"])').first();
-                await scrollToElement(ellipsisBtn);
-                await ellipsisBtn.click();
-                console.log("Clicked ellipsis menu");
-                await page.waitForTimeout(1000);
-
-                const removeBtn = page.locator('button').filter({ hasText: /^Remove$/ }).first();
-                await removeBtn.waitFor({ state: "visible" });
-                await removeBtn.click();
-                console.log("Clicked Remove dropdown option");
-
-                const confirmBtn = page.locator('button[data-hook="z-modal-submit"]');
-                await confirmBtn.waitFor({ state: "visible" });
-                await confirmBtn.click();
-                console.log("Confirmed deletion on modal.");
-                
-                await page.waitForTimeout(2000);
-
-                // Return result instead of throwing — so the upload loop can still count this as an attempt
-                return { removed: true, statusName };
-              }
-
-              console.log("No recognizable status badge found yet. Could be loading or lost context...");
-              await page.waitForTimeout(20000);
-            }
-            
-            console.log("Warning: Status check timed out. Proceeding anyway.");
-            return { removed: false, statusName: "UNKNOWN" };
-          }
 
           // ── Random Fingerprint Pool ────────────────────────────────
           const FP_USER_AGENTS = [
@@ -4290,7 +4085,7 @@ jobs:
             // ── Chrome on Linux ────────────────────────────────────────
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-            // ── Chrome on Windows (extra) ─────────────────────────────
+            // ── Chrome on Windows (extra versions) ────────────────────
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36",
@@ -4303,13 +4098,13 @@ jobs:
             "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            // ── Edge extra ────────────────────────────────────────────
+            // ── Edge on Windows (extra versions) ──────────────────────
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-            // ── Chrome on macOS extra ─────────────────────────────────
+            // ── Chrome on macOS (extra versions) ──────────────────────
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -4318,36 +4113,39 @@ jobs:
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-            // ── Safari on macOS ───────────────────────────────────────
+            // ── Safari on macOS ────────────────────────────────────────
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.3 Safari/605.1.15",
-            // ── Firefox extra ─────────────────────────────────────────
+            // ── Firefox on Windows (extra versions) ───────────────────
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/137.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+            // ── Firefox on macOS ───────────────────────────────────────
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:136.0) Gecko/20100101 Firefox/136.0",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:130.0) Gecko/20100101 Firefox/130.0",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0",
-            // ── Opera / Brave ─────────────────────────────────────────
+            // ── Opera on Windows ───────────────────────────────────────
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 OPR/118.0.0.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 OPR/115.0.0.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 OPR/110.0.0.0",
+            // ── Brave on Windows ───────────────────────────────────────
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Brave/135",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Brave/130",
-            // ── Android Chrome ────────────────────────────────────────
+            // ── Chrome on Android (mobile) ─────────────────────────────
             "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.6478.122 Mobile Safari/537.36",
             "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.6998.135 Mobile Safari/537.36",
             "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.86 Mobile Safari/537.36",
             "Mozilla/5.0 (Linux; Android 14; SM-A546E) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6613.127 Mobile Safari/537.36",
             "Mozilla/5.0 (Linux; Android 12; Redmi Note 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36",
+            // ── Samsung Internet on Android ────────────────────────────
             "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/27.0 Chrome/130.0.0.0 Mobile Safari/537.36",
             "Mozilla/5.0 (Linux; Android 13; SM-A546B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/25.0 Chrome/121.0.0.0 Mobile Safari/537.36",
-            // ── Linux extra ───────────────────────────────────────────
+            // ── Chrome on Linux (extra) ────────────────────────────────
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0",
@@ -4443,7 +4241,7 @@ jobs:
               const fpUAPool = (UA_GROUPS_MAP[UA_GROUP_SEL] && UA_GROUPS_MAP[UA_GROUP_SEL].length > 0)
                 ? UA_GROUPS_MAP[UA_GROUP_SEL]
                 : FP_USER_AGENTS;
-              console.log(`🌐 UA Group: "${UA_GROUP_SEL}" → pool size: ${fpUAPool.length}`);
+              console.log(`\ud83c\udf10 UA Group: "${UA_GROUP_SEL}" → pool size: ${fpUAPool.length}`);
               const fpVP       = fpRand(FP_VIEWPORTS);
               const fpUA       = fpRand(fpUAPool);
               const fpHC       = fpRand(FP_HC);
@@ -4664,16 +4462,16 @@ jobs:
                       function isProtected(el) {
                         if (!el) return false;
                         if (el.querySelector("[data-hook]") || el.closest("[data-hook]")) return true;
-                        
+
                         let current = el;
                         while (current) {
                           if (current.tagName === 'DIALOG' || 
                               current.getAttribute('role') === 'dialog' || 
                               current.classList.contains('sc-gKXOVf') ||
                               current.classList.contains('dwmyJL')) {
-                            
+
                             if (current.id === 'didomi-host') return false;
-                            
+
                             const text = (current.innerText || current.textContent || "").toLowerCase();
                             const uploadKeywords = [
                               "upload",
@@ -4779,165 +4577,27 @@ jobs:
               console.log(`Page URL before login: ${page.url()}`);
               console.log(`Page title before login: ${await page.title()}`);
 
-              // ── DIDOMI CONSENT POPUP HANDLER ──────────────────
-              // Handles the Didomi cookie consent modal by clicking Accept/Close button
-              // This ensures proper consent is registered with the website
-              // ──────────────────────────────────────────────────────────────
-              console.log("Checking for Didomi cookie consent modal...");
-              
-              try {
-                // Wait for Didomi modal to appear (with timeout)
-                const didomiModal = page.locator('#didomi-host');
-                await didomiModal.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
-                const modalVisible = await didomiModal.isVisible().catch(() => false);
-                
-                if (modalVisible) {
-                  console.log("✅ Didomi consent modal detected - handling cookie consent...");
-                  
-                  // Try to click Accept/Close button
-                  const acceptButton = page.locator('#didomi-notice-agree-button');
-                  const acceptExists = await acceptButton.isVisible({ timeout: 3000 }).catch(() => false);
-                  
-                  if (acceptExists) {
-                    console.log('Clicking "Accept All Cookies" or "Close" button...');
-                    await acceptButton.click();
-                    await page.waitForTimeout(1000);
-                    console.log('✅ Successfully clicked Accept/Close button');
-                  } else {
-                    // Fallback: Try "Do not Share/Sell" button if Accept not found
-                    const learnMoreButton = page.locator('#didomi-notice-learn-more-button');
-                    const learnMoreExists = await learnMoreButton.isVisible({ timeout: 2000 }).catch(() => false);
-                    
-                    if (learnMoreExists) {
-                      console.log('Clicking "Do not Share or Sell my Personal Information" button...');
-                      await learnMoreButton.click();
-                      await page.waitForTimeout(1000);
-                      console.log('✅ Successfully clicked "Do not Share or Sell" button');
-                    } else {
-                      console.log('⚠️ No clickable Didomi buttons found - modal may require manual intervention');
-                    }
-                  }
-                  
-                  // Verify modal is gone
-                  await page.waitForTimeout(500);
-                  const stillVisible = await didomiModal.isVisible().catch(() => false);
-                  if (!stillVisible) {
-                    console.log("✅ Didomi consent modal successfully dismissed");
-                  } else {
-                    console.log("⚠️ Modal may still be visible, proceeding anyway...");
-                  }
-                } else {
-                  console.log("ℹ️ No Didomi consent modal detected (already dismissed or not present)");
-                }
-              } catch (err) {
-                console.error("⚠️ Error handling Didomi consent:", err.message);
-                console.log("Attempting to proceed with login anyway...");
+              // v30: API-only login (pure requests, no clicks). No UI fallback.
+              zApi.ctx = context;
+              if (!zedgeEmail || !zedgePassword) throw new Error("LOGIN_FAILED => ZEDGE_EMAIL / ZEDGE_PASSWORD secret missing");
+              let apiLogin;
+              try { apiLogin = await zApiLogin(context, zedgeEmail, zedgePassword); }
+              catch (le) {
+                // session may already be alive (e.g. only the token step failed) -> reuse it via /auth/token
+                try { await zApiAttach(context); apiLogin = { email: zApi.email }; console.log("API login step failed (" + le.message + ") but the session is alive -> token OK"); }
+                catch (_) { throw new Error("LOGIN_FAILED => API login failed: " + le.message); }
               }
+              console.log("✅ API login OK" + (apiLogin && apiLogin.email ? " (account " + apiLogin.email + ")" : ""));
+              await page.goto("https://upload.zedge.net", { waitUntil: "domcontentloaded" }).catch(() => {});
+              await page.waitForTimeout(1500);
+              await page.screenshot({ path: "zedge-after-login.png", fullPage: true }).catch(() => {});
 
-              // v27.11.4: network-level login confirmation (from HAR of a logged-in session). Right after a successful
-              // login the SPA calls POST /auth/token -> {accessToken, expiresAt} and GET /auth/user-info?scope=user ->
-              // {email, username, expiresAt}. Both are cookie-session based, so we listen for them AND poll user-info
-              // ourselves from inside the page - this works even when the dashboard / bell icon renders late or not at all.
-              const loginNet = { via: null, email: null, username: null };
-              page.on("response", (res) => {
-                try {
-                  const u = res.url();
-                  if (res.status() !== 200) return;
-                  if (u.indexOf("upload.zedge.net/auth/user-info") >= 0) {
-                    res.json().then((j) => { if (j && j.email) { loginNet.via = "network:/auth/user-info"; loginNet.email = j.email; loginNet.username = j.username || null; } }).catch(() => {});
-                  } else if (u.indexOf("upload.zedge.net/auth/token") >= 0) {
-                    res.json().then((j) => { if (j && j.accessToken) { if (!loginNet.via) loginNet.via = "network:/auth/token"; } }).catch(() => {});
-                  }
-                } catch (_) {}
-              });
-
-              await safeClickWithPopupRecovery(
-                page,
-                page.locator('[data-hook="za-login-email"]').first(),
-                "Continue with Email",
-                30000,
-                5
-              );
-
-              await safeType(
-                page.locator('[data-hook="form-field-email-input"]'),
-                zedgeEmail,
-                "email"
-              );
-
-              await safeClick(
-                page.locator('button[data-hook="za-submit"]'),
-                "Continue"
-              );
-
-              await safeType(
-                page.locator('[data-hook="form-field-password-input"]'),
-                zedgePassword,
-                "password"
-              );
-
-              await safeClick(
-                page.locator('button[data-hook="za-submit"]'),
-                "Login"
-              );
-
-              console.log("Waiting for login success (auth/user-info API + dashboard / profiles / bell icon)");
-              // v27.11.3/v27.11.4: the bell icon alone is NOT a reliable login signal. Login is confirmed by (in order):
-              //   1. network: GET /auth/user-info?scope=user answered 200 with {email} (or POST /auth/token with accessToken)
-              //   2. active probe: fetch("/auth/user-info?scope=user") from inside the page with the session cookie -> {email}
-              //   3. DOM: "Dashboard" + input[name="period"], UNLOCKS/USERS/NET REVENUE cards, "All profiles" filter,
-              //      Profiles nav link, /profiles URL, bell icon
-              // A visible login error (wrong password, captcha, locked) fails fast instead of waiting 4 minutes.
-              const loginSuccessSignal = () => {
-                const vis = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-                const txt = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
-                const all = (sel) => Array.from(document.querySelectorAll(sel));
-                const has = (sel, t) => all(sel).some((el) => vis(el) && (t ? txt(el).toUpperCase() === t : true));
-                const body = ((document.body && document.body.innerText) || "").replace(/\s+/g, " ");
-                const loginFormOpen = has('[data-hook="form-field-password-input"]') || has('[data-hook="form-field-email-input"]') || has('[data-hook="za-login-email"]');
-                if (has('input[name="period"]') && /\bDashboard\b/.test(body)) return "dom:dashboard-period-picker";
-                if (has("span", "NET REVENUE") || has("span", "UNLOCKS") || has("span", "USERS")) return "dom:dashboard-revenue-cards";
-                if (has('input[name="profiles"]') || /\bAll profiles\b/.test(body)) return "dom:dashboard-profiles-filter";
-                if (has('svg[data-icon="bell"]')) return "dom:bell-icon";
-                if (!loginFormOpen && all('a[href*="/profiles"]').some(vis)) return "dom:profiles-nav-link";
-                if (!loginFormOpen && /\/profiles(\/|$)/.test(location.pathname)) return "dom:profiles-url";
-                const err = body.match(/(invalid (email|password|credentials)|incorrect (email|password)|wrong password|password (is|was) (incorrect|invalid)|account (is |has been )?(locked|disabled|suspended)|too many attempts|verify your email|captcha)/i);
-                if (err && loginFormOpen) return "ERROR:" + err[0];
-                return false;
-              };
-              // Probe runs inside the page so the httpOnly session cookie is sent automatically.
-              const probeUserInfo = () => fetch("/auth/user-info?scope=user", { credentials: "include", cache: "no-store", headers: { "content-type": "application/json" } })
-                .then((r) => (r.ok ? r.json().then((j) => ({ status: r.status, email: j && j.email || null, username: j && j.username || null })) : { status: r.status, email: null }))
-                .catch((e) => ({ status: 0, email: null, err: String(e && e.message || e) }));
-              let loginSignal = null;
-              let loginUser = null;
-              const loginDeadline = Date.now() + 4 * 60 * 1000;
-              let loginProbes = 0;
-              while (!loginSignal && Date.now() < loginDeadline) {
-                if (loginNet.via && (loginNet.email || loginNet.via === "network:/auth/token")) {
-                  loginSignal = loginNet.via; loginUser = loginNet.email;
-                  if (!loginUser) { const p = await page.evaluate(probeUserInfo).catch(() => null); if (p && p.email) { loginUser = p.email; loginSignal = "network:/auth/token+probe"; } }
-                  break;
-                }
-                const probe = await page.evaluate(probeUserInfo).catch(() => null);
-                loginProbes++;
-                if (probe && probe.email) { loginSignal = "api:/auth/user-info"; loginUser = probe.email; break; }
-                const dom = await page.evaluate(loginSuccessSignal).catch(() => false);
-                if (dom) { loginSignal = dom; break; }
-                if (loginProbes % 10 === 1) console.log("  ...still waiting for login (user-info status " + (probe ? probe.status : "n/a") + ", url " + page.url() + ")");
-                await page.waitForTimeout(2000);
-              }
-              if (!loginSignal) {
-                await page.screenshot({ path: "zedge-login-stuck.png", fullPage: true }).catch(() => {});
-                const bodyText = await page.evaluate(() => (document.body && document.body.innerText || "").slice(0, 400)).catch(() => "");
-                throw new Error("LOGIN_STUCK => Zedge did not confirm login within 4 min (no /auth/user-info session, no dashboard). Possible captcha / verification / wrong password / site slow. URL: " + page.url() + (bodyText ? " | page: " + bodyText.replace(/\s+/g, " ").slice(0, 300) : ""));
-              }
-              if (typeof loginSignal === "string" && loginSignal.indexOf("ERROR:") === 0) {
-                await page.screenshot({ path: "zedge-login-stuck.png", fullPage: true }).catch(() => {});
-                throw new Error("LOGIN_FAILED => Zedge showed a login error: \"" + loginSignal.slice(6) + "\" (check ZEDGE_EMAIL / ZEDGE_PASSWORD secrets). URL: " + page.url());
-              }
-              console.log("✅ Login success detected via: " + loginSignal + (loginUser ? " (account " + loginUser + ")" : ""));
-              await page.screenshot({ path: "zedge-after-login.png", fullPage: true });
+              // v30: API token + profile list (same order as the Profiles page). No UI fallback.
+              if (!zApi.ready) await zApiAttach(context);
+              await zApiLoadProfiles();
+              await zSaveAccountInfo();   // v41: business name for the panel / apps account switcher
+              if (!zApi.profiles || !zApi.profiles.length) throw new Error("API: no profiles found on this account");
+              console.log("Mode => API only (login + profiles + upload)");
 
               // ─────────────────────────────────────────────────────────────
               // 5. UPLOAD LOOP — repeat up to remainingUploads times
@@ -4946,7 +4606,7 @@ jobs:
               let failedCount = 0;
               let removedCount = 0;
               const runStartedAt = Date.now();
-              const runLabel = process.env.FOLDER_NAME || "Zedge Bot";
+              const runLabel = zAccountLabel("Zedge Bot");
               const DAILY_LIMIT_UI = 3; // matches ZEDGE_DAILY_LIMIT
               const DAY_TYPE_BN = { AUDIO: "🎵 রিংটোন ডে", WALLPAPER: "🖼️ ওয়ালপেপার ডে", WALLPAPER_24H: "🌅 ২৪ ঘণ্টার ওয়ালপেপার ডে", WALLPAPER_DUAL: "🔒 ডুয়াল ওয়ালপেপার ডে", WALLPAPER_BATTERY: "🔋 ব্যাটারি ওয়ালপেপার ডে", LIVE_WALLPAPER: "🎬 লাইভ ওয়ালপেপার ডে", CHARGING_ANIMATION: "⚡ চার্জিং অ্যানিমেশন ডে" };
               const CTYPE_BN = {
@@ -4959,7 +4619,7 @@ jobs:
                 CHARGING_ANIMATION: "চার্জিং অ্যানিমেশন"
               };
               const STATUS_UI = {
-                PUBLISHED: "✅ PUBLISHED", "IN REVIEW": "🔍 IN REVIEW", PENDING: "⏳ PENDING", REJECTED: "⛔ REJECTED", UNKNOWN: "❓ UNKNOWN"
+                PUBLISHED: "✅ PUBLISHED", "IN REVIEW": "🔍 IN REVIEW", PENDING: "⏳ PENDING", REJECTED: "⛔ REJECTED", FAILED: "❌ FAILED", UNKNOWN: "❓ UNKNOWN"
               };
               const ctypeLabel = (qi) => CTYPE_BN[qi?.contentType] || (qi?.isMp3 ? CTYPE_BN.RINGTONE : CTYPE_BN.WALLPAPER);
               // v25: Telegram day label - mix mode shows the mode + this slot's content type instead of the day type
@@ -4967,6 +4627,15 @@ jobs:
                 ? `🎨 মিক্স মোড${qi && qi.varietyType ? " · " + (CTYPE_BN[qi.varietyType] || qi.varietyType) : ""}`
                 : (DAY_TYPE_BN[dayType] || dayType);
               // Card-style message builder: header line + key/value rows + footer
+              // v29: Telegram profile label = same numbering as the panel (#1, #2 ...) + profile name from the API
+              const tgProfileLabel = () => `প্রোফাইল #${currentProfileIndex + 1}${zApi.cur ? " · " + tgEscape(zApi.cur.name) : ""}`;
+              // v31: foldable row (empty = row hidden, e.g. no foldable image for this item)
+              const foldTgLabel = (q) => {
+                if (!q || !q.hasFoldSource) return "";
+                if (q.foldResult === "ok") return "✅ সেট হয়েছে";
+                if (!q.localFold) return `⚠️ বাদ (${tgEscape(String(q.foldNote || "invalid image").slice(0, 80))})`;
+                return `⚠️ ব্যর্থ (${tgEscape(String(q.foldResult || "unknown").slice(0, 80))})`;
+              };
               const tgCard = (header, rows, footer) => {
                 const body = rows.filter(r => r && r[1] !== undefined && r[1] !== null && r[1] !== "").map(([k, v]) => `${k} ${v}`).join("\n");
                 return [header, "━━━━━━━━━━━━━━━━", body, footer ? `\n${footer}` : ""].filter(Boolean).join("\n");
@@ -5029,25 +4698,15 @@ jobs:
                 }
 
                 try {
-                  // Navigate back to Zedge portal for each upload
-                  console.log("Navigating to Zedge upload portal");
-                  await gotoSafe(page, "https://upload.zedge.net", { waitUntil: "domcontentloaded" });
-                  await page.waitForLoadState("networkidle");
-
-                  // Click Profiles tab
-                  await safeClick(
-                    page.locator('a:has-text("Profiles")').first(),
-                    "Profiles"
-                  );
+                  // v30: profile list from the API (same order as the Profiles page)
+                  zApi.cur = null;
 
                   // ── Profile-count guard ───────────────────────────────────────────
                   // Count how many profile cards REALLY exist on this account and never
                   // click an index that does not exist (e.g. total_profiles=3 but the
                   // account only has 1 profile -> nth(1) timeout).
-                  const profileCards = page.locator('[data-hook="profile-list"] > div');
-                  try { await profileCards.first().waitFor({ state: "visible", timeout: 30000 }); } catch (_) {}
-                  const actualProfiles = await profileCards.count();
-                  console.log(`Profiles on account: ${actualProfiles} | configured total_profiles: ${TOTAL_PROFILES}`);
+                  const actualProfiles = zApi.profiles.length;
+                  console.log(`Profiles on account (API): ${actualProfiles} | configured total_profiles: ${TOTAL_PROFILES}`);
                   if (actualProfiles === 0) {
                     throw new Error("No profile found on the Zedge Profiles page ([data-hook=\"profile-list\"] is empty). Create/approve a profile first.");
                   }
@@ -5079,20 +4738,15 @@ jobs:
                   }
                   // ─────────────────────────────────────────────────────────────────
 
-                  // Click the correct rotated profile
-                  await safeClick(
-                    profileCards.nth(currentProfileIndex),
-                    `Profile Index ${currentProfileIndex}`
-                  );
-
-                  // Wait for the profile page to fully render before touching anything.
-                  await page.waitForLoadState("networkidle");
-                  await page.waitForTimeout(1500);
+                  const apiProfile = zApi.profiles[currentProfileIndex];
+                  if (!apiProfile) throw new Error(`API: profile #${currentProfileIndex + 1} not found (account has ${actualProfiles})`);
+                  zApi.cur = apiProfile;
+                  console.log(`🎯 Profile #${currentProfileIndex + 1}: "${apiProfile.name}" [${apiProfile.status}] id ${apiProfile.id}`);
 
                   // Navigate directly to the correct content-type URL so we never need to
                   // interact with the unreliable type-selection modal.
                   // URL shape: .../profiles/<profileId>/content/WALLPAPER  (or AUDIO)
-                  const profilePageUrl = page.url();
+                  const profilePageUrl = zProfileUrl(apiProfile);
                   const profileBase    = profilePageUrl.replace(/\/content\/[^\/].*$/, "");
                   const ZEDGE_TYPE_URLS = {
                     RINGTONE: "AUDIO",
@@ -5106,36 +4760,29 @@ jobs:
                   const itemCType = queueItem.contentType || (queueItem.isMp3 ? "RINGTONE" : "WALLPAPER");
                   const targetType = ZEDGE_TYPE_URLS[itemCType] || (queueItem.isMp3 ? "AUDIO" : "WALLPAPER");
                   const targetContentUrl = `${profileBase}/content/${targetType}`;
-                  console.log(`Navigating directly to ${targetType} page: ${targetContentUrl}`);
-                  await gotoSafe(page, targetContentUrl, { waitUntil: "domcontentloaded" });
-                  await page.waitForLoadState("networkidle");
-                  await page.waitForTimeout(1000);
-
-                  // Click the Upload (+) button — now already on the right content-type page
-                  await safeClick(
-                    page.locator("svg.fa-plus").first(),
-                    "Upload plus icon"
-                  );
-
-                  // Wait for upload dialog to appear
-                  await page.waitForTimeout(800);
-                  await page.screenshot({ path: `zedge-upload-menu-${uploadNum}.png`, fullPage: false });
-
-                  // Upload the file(s) - 24H sets pass all 4 images at once
+                  // v30: API-only upload (create -> meta+publish -> status -> remove). No UI fallback.
                   const filesForUpload = (queueItem.localFiles && queueItem.localFiles.length) ? queueItem.localFiles : queueItem.localFile;
-                  await uploadWallpaperInDialog(page, filesForUpload);
-
-                  // Fill in meta (title, tags, category, description)
-                  await fillMetaDialog(page, {
-                    title:       queueItem.title,
-                    tags:        queueItem.tags,
-                    category:    queueItem.category,
-                    description: queueItem.description,
-                    coverImage:  queueItem.localThumb || null
-                  });
-
-                  // Check publish status — returns {removed, statusName} instead of throwing
-                  const publishResult = await verifyPublishStatus(page);
+                  if (!Z_API_TYPES[targetType]) throw new Error(`API: content type ${targetType} not supported`);
+                  let publishResult = null;
+                  console.log(`🚀 API upload: ${targetType} -> profile #${currentProfileIndex + 1} "${apiProfile.name}"`);
+                  let made;
+                  try {
+                    made = await zApiUploadAndPublish(apiProfile.id, targetType, {
+                      title: queueItem.title, tags: queueItem.tags, category: queueItem.category, description: queueItem.description
+                    }, filesForUpload, queueItem.localThumb || null, queueItem.localFold || null);
+                    queueItem.foldResult = made && made.fold;
+                  } catch (apiErr) {
+                    if (apiErr.apiCreatedId) {
+                      console.warn(`Archiving half-made API draft ${apiErr.apiCreatedId}`);
+                      await zArchive(apiErr.apiCreatedId).catch((e) => console.warn("archive failed: " + e.message));
+                    }
+                    throw new Error("API upload failed: " + apiErr.message);
+                  }
+                  try { publishResult = await zApiVerifyStatus(apiProfile.id, targetType, made.id); }
+                  catch (ve) { console.warn("API status check failed (item already published, not retrying): " + ve.message); publishResult = { removed: false, statusName: "UNKNOWN" }; }
+                  // content page only for the Telegram screenshot
+                  await page.goto(targetContentUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+                  await page.waitForTimeout(2500);
 
                   const finalShotPath = `zedge-final-${uploadNum}.png`;
                   await page.screenshot({ path: finalShotPath, fullPage: true });
@@ -5190,10 +4837,12 @@ jobs:
                       `⚠️ <b>Zedge কনটেন্ট সরিয়ে দিয়েছে</b>`,
                       [
                         ["👋", `${greeting}।`],
-                        ["📁 প্রজেক্ট:", `${tgEscape(runLabel)} · প্রোফাইল #${currentProfileIndex}`],
+                        ["📁 প্রজেক্ট:", `${tgEscape(runLabel)} · ${tgProfileLabel()}`],
                         ["🗂 কনটেন্ট:", fileTypeLabel],
+                        ["📱 Foldable:", foldTgLabel(queueItem)],
                         ["🏷 টাইটেল:", `<b>“${itemTitle}”</b>`],
                         ["📌 Zedge স্ট্যাটাস:", statusLine],
+                        ["📝 কারণ:", publishResult.message ? `<code>${tgEscape(String(publishResult.message).slice(0, 160))}</code>` : ""],
                         ["📅 আজকের ডে:", `${dayLabelBn(queueItem)} · আপলোড ${todayProgress}`],
                         ["🕒 সময়:", fmtDhakaTime()]
                       ],
@@ -5205,8 +4854,9 @@ jobs:
                       `✅ <b>আপলোড সম্পন্ন</b>`,
                       [
                         ["👋", `${greeting}।`],
-                        ["📁 প্রজেক্ট:", `${tgEscape(runLabel)} · প্রোফাইল #${currentProfileIndex}`],
+                        ["📁 প্রজেক্ট:", `${tgEscape(runLabel)} · ${tgProfileLabel()}`],
                         ["🗂 কনটেন্ট:", fileTypeLabel],
+                        ["📱 Foldable:", foldTgLabel(queueItem)],
                         ["🏷 টাইটেল:", `<b>“${itemTitle}”</b>`],
                         ["📌 Zedge স্ট্যাটাস:", statusLine],
                         ["📅 আজকের ডে:", `${dayLabelBn(queueItem)} · আপলোড ${todayProgress}`],
@@ -5218,7 +4868,7 @@ jobs:
                     );
                     console.log(`✅ Upload ${uploadNum} complete! Status: ${publishResult.statusName}. (${successCount} this run)`);
                   }
-                  
+
                   if (publishResult.statusName === "PUBLISHED" || publishResult.statusName === "IN REVIEW" || publishResult.statusName === "REJECTED") {
                     await sendTelegramAttachment(finalShotPath, "image", notifyMsg);
                   } else {
@@ -5243,7 +4893,7 @@ jobs:
                       `❌ <b>আপলোড ব্যর্থ</b>`,
                       [
                         ["👋", `${getDhakaGreeting()}।`],
-                        ["📁 প্রজেক্ট:", `${tgEscape(runLabel)} · প্রোফাইল #${currentProfileIndex}`],
+                        ["📁 প্রজেক্ট:", `${tgEscape(runLabel)} · ${tgProfileLabel()}`],
                         ["🗂 কনটেন্ট:", ctypeLabel(queueItem)],
                         ["🏷 টাইটেল:", `<b>“${tgEscape(queueItem?.title || queueItem?.name || "N/A")}”</b>`],
                         ["🧩 ত্রুটি:", `<code>${errSnippet}</code>`],
@@ -5331,7 +4981,7 @@ jobs:
               }
 
               await browser.close();
-              
+
               // Exit cleanly
               process.exit(0);
 
@@ -5356,7 +5006,7 @@ jobs:
               await markRemainingGateSlots(0, { status: "failed", error: ("fatal: " + String((err && err.message) || err || "unknown")).replace(/\s+/g, " ").slice(0, 200) }).catch(() => {});
               // Notify user of fatal crash before exiting
               try {
-                const crashFolder = process.env.FOLDER_NAME || "Zedge Bot";
+                const crashFolder = zAccountLabel("Zedge Bot");
                 const crashSnippet = tgEscape(String(err?.message || err || "Unknown fatal error").slice(0, 200));
                 const fatalMsg = [
                   `🚨 <b>সিস্টেম ক্র্যাশ রিপোর্ট</b>`,
@@ -5386,7 +5036,7 @@ jobs:
               if (context) await context.close().catch(() => {});
               if (fatalVideoPath) {
                 await new Promise(resolve => setTimeout(resolve, 2000));
-                const crashFolder = process.env.FOLDER_NAME || "Zedge Bot";
+                const crashFolder = zAccountLabel("Zedge Bot");
                 const videoCaption = `🎬 <b>ক্র্যাশ রেকর্ডিং</b> · ${tgEscape(crashFolder)} · ${fmtDhakaTime()}`;
                 await sendTelegramAttachment(fatalVideoPath, "video", videoCaption).catch(() => {});
               }
@@ -5413,24 +5063,25 @@ jobs:
           # v28: login from the dispatch inputs, or (safer) from the GitHub secrets ZEDGE4_EMAIL / ZEDGE4_PASSWORD
           ZEDGE_EMAIL: ${{ github.event.inputs.zedge_email || secrets.ZEDGE4_EMAIL }}
           ZEDGE_PASSWORD: ${{ github.event.inputs.zedge_password || secrets.ZEDGE4_PASSWORD }}
-          # v28 security: from GitHub Secrets (needed by bot.js)
+          # v28 security: all secrets below live in GitHub Secrets, never in this file
           FIREBASE_DB_URL: ${{ secrets.ZEDGE4_DB_URL }}
           R2_WORKER_URL: ${{ secrets.R2_WORKER_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           HEADLESS: ${{ github.event.inputs.headless }}
           TOTAL_PROFILES: ${{ github.event.inputs.total_profiles }}
           UA_GROUP: ${{ github.event.inputs.ua_group }}
-          # Telegram reports go to Tarek bhai's bot by default; repository secrets override if set
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FOLDER_NAME: "Zedge 4"
+          # v30 API only. Optional: force the geo country header (GitHub > Settings > Variables)
+          ZEDGE_GEO_COUNTRY: ${{ vars.ZEDGE_GEO_COUNTRY || '' }}
+          # MH-EARNINGS: payout threshold in USD (the report is saved to this
+          # account's own Firebase: dashboardSettings/earnings)
+          EARN_THRESHOLD: "50"
           EXACT_TARGET_DHAKA: ${{ needs.gate.outputs.target }}   # v26.2: gate released early, hold Publish until this minute
           # v27.11 missed-slot recovery: slot(s) served by this run + how many uploads (2 when a missed slot is merged in)
           GATE_SLOTS: ${{ needs.gate.outputs.slots }}
           GATE_RETRY_SLOTS: ${{ needs.gate.outputs.retries }}
           UPLOADS_PER_RUN: ${{ needs.gate.outputs.count || '1' }}
-          # MH-EARNINGS: payout threshold in USD (the report is saved to this
-          # account's own Firebase: dashboardSettings/earnings)
-          EARN_THRESHOLD: "50"
 
         run: node bot.js
 
